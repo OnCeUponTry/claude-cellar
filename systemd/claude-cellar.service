@@ -5,6 +5,11 @@ After=default.target
 
 [Service]
 Type=simple
+# PATH covers NixOS (run/wrappers/bin for setuid fusermount3, run/current-system
+# for system tools) and standard distros (/usr/bin, /usr/local/bin). fuser
+# needs to spawn fusermount3 to mount; without an explicit PATH the systemd
+# user manager uses a minimal one that misses these.
+Environment=PATH=/run/wrappers/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart={{CELLAR_BIN}} mount --foreground
 ExecStop={{CELLAR_BIN}} umount
 Restart=on-failure

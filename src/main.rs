@@ -1,3 +1,9 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "claude-cellar 0.2+ is Linux-only. \
+     Use v0.1.x for macOS/Windows: cargo install claude-cellar --version '^0.1'"
+);
+
 #[cfg(target_os = "linux")]
 mod fuse;
 mod store;
@@ -404,6 +410,15 @@ fn cmd_mount(
     };
 
     if is_path_mounted_with_cellar(&mount) {
+        // For interactive use this is fine — say so and succeed.
+        // For systemd (--foreground), it MUST fail: Type=simple interprets
+        // a clean ExecStart exit as a crashed daemon and restart-loops.
+        if foreground {
+            return Err(io::Error::other(format!(
+                "{} already has a claude-cellar mount; refusing to start a second daemon",
+                mount.display()
+            )));
+        }
         eprintln!("claude-cellar: already mounted at {}", mount.display());
         return Ok(());
     }
@@ -419,6 +434,15 @@ fn cmd_umount(mount_dir_arg: Option<PathBuf>) -> io::Result<()> {
         Some(p) => p,
         None => mount_dir()?,
     };
+    // Idempotent: if the mount isn't there (e.g. systemd ExecStop after
+    // ExecStart already exited), succeed silently rather than failing.
+    if !is_path_mounted_with_cellar(&mount) {
+        println!(
+            "claude-cellar: nothing to unmount at {} (not a cellar mount)",
+            mount.display()
+        );
+        return Ok(());
+    }
     let status = Command::new("fusermount3")
         .arg("-u")
         .arg(&mount)

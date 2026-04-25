@@ -758,17 +758,55 @@ impl Filesystem for CellarFs {
 
 // ── Mount entry point ───────────────────────────────────────────────────────
 
+/// Wrap an io error with a contextual prefix so we know which path/operation
+/// blew up. The bare `io::Error` from std doesn't include the path that
+/// failed, which makes diagnostics like "ENOENT" useless.
+fn ctx<T>(op: &str, r: io::Result<T>) -> io::Result<T> {
+    r.map_err(|e| io::Error::new(e.kind(), format!("{op}: {e}")))
+}
+
+/// Print to stderr AND log; useful for systemd where stderr lands in journal.
+fn loud(msg: &str) {
+    eprintln!("claude-cellar: {msg}");
+    log_info(msg);
+}
+
+fn loud_err(msg: &str) {
+    eprintln!("claude-cellar: ERROR: {msg}");
+    log_error(msg);
+}
+
 pub fn run_mount(foreground: bool, store_dir: PathBuf, mount_dir: PathBuf) -> io::Result<()> {
-    fs::create_dir_all(&store_dir)?;
-    fs::create_dir_all(&mount_dir)?;
-    let scratch = store::scratch_dir()?;
+    loud(&format!(
+        "starting: store={} mount={} foreground={foreground} \
+         uid={} gid={} XDG_RUNTIME_DIR={:?} HOME={:?}",
+        store_dir.display(),
+        mount_dir.display(),
+        unsafe { libc::getuid() },
+        unsafe { libc::getgid() },
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("HOME"),
+    ));
+
+    ctx(
+        &format!("create_dir_all store_dir={}", store_dir.display()),
+        fs::create_dir_all(&store_dir),
+    )?;
+    ctx(
+        &format!("create_dir_all mount_dir={}", mount_dir.display()),
+        fs::create_dir_all(&mount_dir),
+    )?;
+    let scratch = ctx("resolve scratch_dir", store::scratch_dir())?;
+    loud(&format!("scratch ok: {}", scratch.display()));
 
     if !foreground {
         // Daemonize: fork, child runs in new session detached from terminal.
         unsafe {
             let pid = libc::fork();
             if pid < 0 {
-                return Err(io::Error::last_os_error());
+                let e = io::Error::last_os_error();
+                loud_err(&format!("fork failed: {e}"));
+                return Err(e);
             }
             if pid > 0 {
                 // Parent: wait briefly for child to finish setup, then exit.
@@ -777,10 +815,12 @@ pub fn run_mount(foreground: bool, store_dir: PathBuf, mount_dir: PathBuf) -> io
             }
             // Child: detach.
             if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
+                let e = io::Error::last_os_error();
+                loud_err(&format!("setsid failed: {e}"));
+                return Err(e);
             }
             // Redirect stdio to /dev/null.
-            let devnull = File::open("/dev/null")?;
+            let devnull = ctx("open /dev/null", File::open("/dev/null"))?;
             let null_fd = std::os::unix::io::AsRawFd::as_raw_fd(&devnull);
             libc::dup2(null_fd, 0);
             libc::dup2(null_fd, 1);
@@ -789,9 +829,19 @@ pub fn run_mount(foreground: bool, store_dir: PathBuf, mount_dir: PathBuf) -> io
         }
     }
 
-    // Write PID file.
-    let pid_path = store::pid_file()?;
-    let _ = fs::write(&pid_path, format!("{}\n", std::process::id()));
+    // Write PID file. Non-fatal if it fails — the daemon still works.
+    let pid_path = match store::pid_file() {
+        Ok(p) => {
+            if let Err(e) = fs::write(&p, format!("{}\n", std::process::id())) {
+                loud_err(&format!("pidfile write {} failed: {e} (continuing)", p.display()));
+            }
+            Some(p)
+        }
+        Err(e) => {
+            loud_err(&format!("pidfile resolve failed: {e} (continuing without pidfile)"));
+            None
+        }
+    };
 
     let fs_impl = CellarFs::new(store_dir.clone(), scratch.clone());
     let opts = vec![
@@ -800,17 +850,17 @@ pub fn run_mount(foreground: bool, store_dir: PathBuf, mount_dir: PathBuf) -> io
         MountOption::DefaultPermissions,
     ];
 
-    log_info(&format!(
-        "mount start store={} mount={} scratch={} foreground={foreground}",
-        store_dir.display(),
-        mount_dir.display(),
-        scratch.display()
-    ));
-
+    loud(&format!("calling fuser::mount2 on {}", mount_dir.display()));
     let result = fuser::mount2(fs_impl, &mount_dir, &opts);
 
-    let _ = fs::remove_file(&pid_path);
-    log_info("mount end");
+    if let Some(p) = pid_path {
+        let _ = fs::remove_file(&p);
+    }
+
+    match &result {
+        Ok(()) => loud("mount end (clean)"),
+        Err(e) => loud_err(&format!("mount2 returned: {e}")),
+    }
     result
 }
 
