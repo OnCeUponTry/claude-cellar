@@ -1,5 +1,23 @@
 # claude-cellar
 
+> **⚠️ v0.2.0 and v0.2.1 are unsafe — do not install.**
+>
+> The FUSE layer in v0.2.x does not preserve the `<uuid>/` sibling directories
+> that Claude Code creates for sessions with sub-agents or tool-results.
+> Sessions that used those features may appear correctly in `/resume` but
+> with their auxiliary state hidden, which can cause Claude to misbehave on
+> resume.
+>
+> Both versions have been yanked from crates.io. **Wait for v0.3.0**, which
+> handles the full session bundle (jsonl + sibling dir) and is validated
+> against real sessions with sub-agents. ETA: in progress on the
+> `v0.3-bundle` branch.
+>
+> If you already installed v0.2.x: `claude-cellar uninstall` to stop the
+> daemon and remove the systemd unit. Your data is intact in
+> `~/.local/share/claude-cellar/store/` (or wherever you configured the
+> store) and can be migrated back manually.
+
 Transparent zstd compression for Claude Code session files via a FUSE filesystem.
 
 [Claude Code](https://claude.com/claude-code) stores every session as a plain
