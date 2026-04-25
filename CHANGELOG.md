@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-04-25
+
+### Fixed
+
+- Windows: register a Ctrl+C handler so the wrapper survives Ctrl+C and runs cleanup,
+  achieving parity with the SIGINT/SIGTERM/SIGHUP forwarding already implemented on Unix.
+  Without this fix, hitting Ctrl+C in Windows would leave hydrated .jsonl files orphaned.
+- Cleanup of an unused-variable warning when cross-compiling to Windows.
+- Reorganized the post-wait exit-code resolution to keep clippy lints green across all targets.
+
+### Internal
+
+- Added `ctrlc` as a Windows-only dependency.
+
+[0.1.1]: https://github.com/OnCeUponTry/claude-cellar/releases/tag/v0.1.1
+
 ## [0.1.0] - 2026-04-25
 
 First public release.

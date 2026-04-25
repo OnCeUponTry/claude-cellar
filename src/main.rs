@@ -576,10 +576,10 @@ fn cmd_run(claude_args: Vec<OsString>) -> io::Result<i32> {
 
     // Spawn child, then survive SIGINT/SIGTERM/SIGHUP so we can cleanup.
     let mut child = Command::new(&claude).args(&claude_args).spawn()?;
-    let child_pid = child.id();
 
     #[cfg(unix)]
     let sig_handle = {
+        let child_pid = child.id();
         use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
         use signal_hook::iterator::Signals;
         let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
@@ -594,18 +594,22 @@ fn cmd_run(claude_args: Vec<OsString>) -> io::Result<i32> {
         handle
     };
 
+    #[cfg(windows)]
+    {
+        // Windows propagates Ctrl+C to all processes attached to the console.
+        // Register a no-op handler so the wrapper survives and can run cleanup;
+        // the child still receives the event and exits on its own.
+        let _ = ctrlc::try_set_handler(|| {});
+    }
+
     let status = child.wait()?;
+    #[cfg(unix)]
     let exit = status.code().unwrap_or_else(|| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            status.signal().map(|s| 128 + s).unwrap_or(-1)
-        }
-        #[cfg(not(unix))]
-        {
-            -1
-        }
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map(|s| 128 + s).unwrap_or(-1)
     });
+    #[cfg(not(unix))]
+    let exit = status.code().unwrap_or(-1);
 
     #[cfg(unix)]
     sig_handle.close();
