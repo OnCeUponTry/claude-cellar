@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-04-25
+
+### Added
+
+- `claude-cellar install` now **auto-migrates existing sessions** on first
+  run. Detects three layouts under `~/.claude/projects/`:
+  - empty → no migration; default store is used.
+  - one sub-symlink (NFS-shared layout): the symlink target becomes the
+    store, sessions are reorganised in-place inside it under a project
+    sub-directory named after the symlink, and the symlink is removed
+    (the FUSE replaces it). The systemd unit is written with
+    `Environment=CLAUDE_CELLAR_STORE_DIR=<target>`.
+  - real sub-directories with sessions: default store + migrate
+    everything into it.
+- `migrate-store` now accepts raw `.jsonl` files and compresses them
+  on-the-fly during the move (was zst-only). `--from <symlink>` follows
+  the symlink and uses its name as the project sub-directory.
+- `install` waits for the FUSE mount to actually appear (up to 3 s) and
+  prints a warning if it does not, instead of falsely claiming
+  "Mount active".
+
+### Removed
+
+- All Windows / macOS conditional code, dependencies, and references.
+  The `ctrlc` Windows-only dependency is gone. Cargo.toml `[target.cfg]`
+  blocks are now Linux-only.
+
+### Internal
+
+- Wrapped fallible mount-startup steps with a contextual prefix
+  (`fn ctx`) so future ENOENT errors say which operation failed.
+
+[0.2.1]: https://github.com/OnCeUponTry/claude-cellar/releases/tag/v0.2.1
+
 ## [0.2.0] - 2026-04-25
 
 ### Breaking
@@ -17,8 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registers and starts a `claude-cellar.service` systemd user unit. After
   install, run `claude` natively; the kernel routes its filesystem
   operations to the FUSE daemon.
-- v0.2 is **Linux-only**. macOS and Windows users should stay on v0.1.x
-  until macFUSE/WinFsp adapters are added.
+- v0.2 is **Linux-only**. The crate refuses to compile on other targets
+  with a clear diagnostic.
 
 ### Architecture
 

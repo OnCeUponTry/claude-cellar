@@ -31,6 +31,17 @@ That's it. After `install`, `claude` works as always — the FUSE daemon
 is up, mounted at `~/.claude/projects/`, and started automatically at
 every login.
 
+**If you already had Claude Code sessions** in `~/.claude/projects/`,
+`install` auto-detects them and migrates them into the store
+(compressing raw `.jsonl` and reorganizing into the project-subdir
+layout the FUSE expects). The picker `/resume` shows everything from
+the first launch.
+
+If your `~/.claude/projects/<sub>` is a symlink to another location
+(e.g. an NFS share), `install` follows the symlink and uses that target
+as the store, so your sessions stay where they were rather than being
+moved to a new directory.
+
 ### From source
 
 ```bash
@@ -43,15 +54,12 @@ cp target/release/claude-cellar ~/.local/bin/
 
 ### Migration from v0.1.x
 
+If you used v0.1's `install` (which created a `~/.local/bin/claude` shim):
+
 ```bash
-# If you used v0.1's install (which created a ~/.local/bin/claude shim):
 claude-cellar uninstall   # removes the v0.1 shim, restores the real claude
-
-# Move existing compressed sessions into the new store layout:
-claude-cellar migrate-store
-
-# Install the v0.2 daemon:
-claude-cellar install
+claude-cellar install     # the new install handles the rest, including
+                          # picking up existing .jsonl.zst into the store
 ```
 
 ## What you don't have to do
@@ -149,9 +157,11 @@ All env vars optional. Defaults work out of the box.
 
 ## Platform support
 
-- **Linux x86_64 / aarch64**: first-class. v0.2 is the recommended path.
-- **macOS / Windows**: not supported in v0.2 (FUSE adapters not yet shipped).
-  Stay on v0.1.x; it still works for single-instance use.
+Linux x86_64 / aarch64. Requires a kernel with FUSE (`CONFIG_FUSE_FS`)
+and `fusermount3` in PATH (any modern distro).
+
+claude-cellar does not run on macOS or Windows. The crate refuses to
+compile on those targets with a clear diagnostic.
 
 ## Benchmarks
 

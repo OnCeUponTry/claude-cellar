@@ -239,6 +239,25 @@ impl CellarFs {
     }
 }
 
+/// Heuristic: a directory is a Claude project if it contains at least one
+/// `.jsonl.zst`. Used by the FUSE root readdir to hide unrelated dirs that
+/// may co-exist with the store on shared filesystems.
+fn dir_has_session_zst(dir: &Path) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    for e in rd.flatten() {
+        if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            if s.ends_with(".jsonl.zst") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ── FUSE ops ────────────────────────────────────────────────────────────────
 
 impl Filesystem for CellarFs {
@@ -337,6 +356,13 @@ impl Filesystem for CellarFs {
                     let Some(name_str) = name.to_str() else {
                         continue;
                     };
+                    // Only expose subdirs that look like Claude Code project
+                    // directories (contain at least one .jsonl.zst).
+                    // This filters out unrelated stuff that may co-exist with
+                    // the store on shared filesystems.
+                    if !dir_has_session_zst(&e.path()) {
+                        continue;
+                    }
                     let rel = PathBuf::from(name_str);
                     let child_ino = self.alloc_ino(&rel, InodeKind::Project);
                     entries.push((child_ino, FileType::Directory, name_str.to_string()));

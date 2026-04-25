@@ -1,10 +1,6 @@
 #[cfg(not(target_os = "linux"))]
-compile_error!(
-    "claude-cellar 0.2+ is Linux-only. \
-     Use v0.1.x for macOS/Windows: cargo install claude-cellar --version '^0.1'"
-);
+compile_error!("claude-cellar requires Linux (it depends on FUSE and fusermount3).");
 
-#[cfg(target_os = "linux")]
 mod fuse;
 mod store;
 
@@ -66,7 +62,6 @@ enum Subcmd {
         claude_bin: Option<PathBuf>,
     },
     /// Mount the FUSE filesystem (default: fork-and-exit; use --foreground for systemd)
-    #[cfg(target_os = "linux")]
     Mount {
         #[arg(long)]
         foreground: bool,
@@ -76,7 +71,6 @@ enum Subcmd {
         mount_dir: Option<PathBuf>,
     },
     /// Unmount the FUSE filesystem
-    #[cfg(target_os = "linux")]
     Umount {
         #[arg(long)]
         mount_dir: Option<PathBuf>,
@@ -91,7 +85,6 @@ enum Subcmd {
         dry_run: bool,
     },
     /// Install: register and start the systemd user service
-    #[cfg(target_os = "linux")]
     Install {
         /// Don't enable systemd; just print instructions
         #[arg(long)]
@@ -101,7 +94,6 @@ enum Subcmd {
         claude_bin: Option<PathBuf>,
     },
     /// Uninstall: stop the systemd service, remove shims if any
-    #[cfg(target_os = "linux")]
     Uninstall,
     /// [DEPRECATED v0.2] Transparent wrapper. Use `mount` instead.
     Run {
@@ -119,7 +111,6 @@ enum Subcmd {
 
 // ── Mount detection (used by archive/compress to refuse) ────────────────────
 
-#[cfg(target_os = "linux")]
 fn is_path_mounted_with_cellar(path: &Path) -> bool {
     let canon = match fs::canonicalize(path) {
         Ok(p) => p,
@@ -157,11 +148,6 @@ fn is_path_mounted_with_cellar(path: &Path) -> bool {
             return true;
         }
     }
-    false
-}
-
-#[cfg(not(target_os = "linux"))]
-fn is_path_mounted_with_cellar(_path: &Path) -> bool {
     false
 }
 
@@ -394,7 +380,6 @@ fn cmd_resume(
 
 // ── Mount/umount/status ─────────────────────────────────────────────────────
 
-#[cfg(target_os = "linux")]
 fn cmd_mount(
     foreground: bool,
     store_dir_arg: Option<PathBuf>,
@@ -428,7 +413,6 @@ fn cmd_mount(
     fuse::run_mount(foreground, store, mount)
 }
 
-#[cfg(target_os = "linux")]
 fn cmd_umount(mount_dir_arg: Option<PathBuf>) -> io::Result<()> {
     let mount = match mount_dir_arg {
         Some(p) => p,
@@ -506,52 +490,195 @@ fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn cmd_migrate_store(from: &str, dry_run: bool) -> io::Result<()> {
-    let from = expand_tilde(from);
-    let to = store_dir()?;
-    if !from.is_dir() {
-        return Err(io::Error::other(format!(
-            "source dir not found: {}",
-            from.display()
-        )));
-    }
-    fs::create_dir_all(&to)?;
-    let mut moved = 0usize;
-    let mut bytes = 0u64;
-    for proj in fs::read_dir(&from)?.flatten() {
-        let pft = proj.file_type()?;
-        if !pft.is_dir() {
-            continue;
-        }
-        let proj_name = proj.file_name();
-        let src_dir = proj.path();
-        let dst_dir = to.join(&proj_name);
-        for e in fs::read_dir(&src_dir)?.flatten() {
-            if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
+#[derive(Debug, PartialEq, Eq)]
+enum Layout {
+    Empty,
+    /// Contains `.jsonl` / `.jsonl.zst` files directly.
+    Flat,
+    /// Contains subdirectories that themselves contain sessions.
+    Projected,
+    /// Mixed: both top-level files AND subdirs. Refuse to auto-migrate.
+    Mixed,
+}
+
+fn detect_layout(dir: &Path) -> io::Result<Layout> {
+    let mut has_sessions_at_top = false;
+    let mut has_subdirs_with_sessions = false;
+    for e in fs::read_dir(dir)?.flatten() {
+        let ft = match e.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_file() {
             let n = e.file_name();
             let s = n.to_string_lossy();
-            if !s.ends_with(".jsonl.zst") {
-                continue;
+            if s.ends_with(".jsonl") || s.ends_with(".jsonl.zst") {
+                has_sessions_at_top = true;
             }
-            let src = e.path();
-            let size = e.metadata()?.len();
-            let dst = dst_dir.join(&n);
-            if dry_run {
-                println!("would move {} -> {}", src.display(), dst.display());
-            } else {
-                fs::create_dir_all(&dst_dir)?;
-                fs::rename(&src, &dst)?;
-                println!("moved {} -> {}", src.display(), dst.display());
+        } else if ft.is_dir() {
+            // Skip if it looks like a known noise dir (none for now).
+            for inner in fs::read_dir(e.path())?.flatten() {
+                if inner.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    let n = inner.file_name();
+                    let s = n.to_string_lossy();
+                    if s.ends_with(".jsonl") || s.ends_with(".jsonl.zst") {
+                        has_subdirs_with_sessions = true;
+                        break;
+                    }
+                }
             }
-            moved += 1;
-            bytes += size;
         }
     }
+    Ok(match (has_sessions_at_top, has_subdirs_with_sessions) {
+        (false, false) => Layout::Empty,
+        (true, false) => Layout::Flat,
+        (false, true) => Layout::Projected,
+        (true, true) => Layout::Mixed,
+    })
+}
+
+/// Move one session into the store. Compresses if raw, plain rename if already zst.
+/// Returns size of the source.
+fn migrate_one(src: &Path, dst_zst: &Path, dry_run: bool) -> io::Result<u64> {
+    let n = src
+        .file_name()
+        .ok_or_else(|| io::Error::other("source has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let size = src.metadata()?.len();
+    if dry_run {
+        let kind = if n.ends_with(".jsonl.zst") {
+            "move"
+        } else {
+            "compress+move"
+        };
+        println!("would {kind} {} -> {}", src.display(), dst_zst.display());
+        return Ok(size);
+    }
+    if let Some(parent) = dst_zst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if n.ends_with(".jsonl.zst") {
+        fs::rename(src, dst_zst)?;
+        // Sidecar follows the .zst — also rename it if present.
+        let src_meta = store::sidecar_path(src);
+        let dst_meta = store::sidecar_path(dst_zst);
+        let _ = fs::rename(&src_meta, &dst_meta);
+    } else if n.ends_with(".jsonl") {
+        store::atomic_compress_to_store(src, dst_zst)?;
+        fs::remove_file(src)?;
+    } else {
+        return Err(io::Error::other(format!(
+            "unrecognised session filename: {n}"
+        )));
+    }
+    Ok(size)
+}
+
+/// Core migration. `from` is already canonical (symlinks resolved by caller).
+/// `into_subdir` is used when `from` is flat: gives the project name under store.
+fn migrate_dir(
+    from: &Path,
+    into_subdir: Option<&str>,
+    store: &Path,
+    dry_run: bool,
+) -> io::Result<(usize, u64)> {
+    let layout = detect_layout(from)?;
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    match layout {
+        Layout::Empty => {
+            println!("source is empty; nothing to migrate");
+        }
+        Layout::Flat => {
+            let proj = into_subdir.ok_or_else(|| {
+                io::Error::other(
+                    "source is a flat dir of sessions; need --into-subdir <project-name>",
+                )
+            })?;
+            let dst_dir = store.join(proj);
+            for e in fs::read_dir(from)?.flatten() {
+                if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let n = e.file_name();
+                let s = n.to_string_lossy();
+                let stem = if let Some(stem) = s.strip_suffix(".jsonl.zst") {
+                    stem
+                } else if let Some(stem) = s.strip_suffix(".jsonl") {
+                    stem
+                } else {
+                    continue;
+                };
+                let dst_zst = dst_dir.join(format!("{stem}.{JSONL_EXT}.{ZST_EXT}"));
+                let size = migrate_one(&e.path(), &dst_zst, dry_run)?;
+                count += 1;
+                bytes += size;
+            }
+        }
+        Layout::Projected => {
+            for proj in fs::read_dir(from)?.flatten() {
+                if !proj.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let proj_name = proj.file_name();
+                let dst_dir = store.join(&proj_name);
+                for e in fs::read_dir(proj.path())?.flatten() {
+                    if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        continue;
+                    }
+                    let n = e.file_name();
+                    let s = n.to_string_lossy();
+                    let stem = if let Some(stem) = s.strip_suffix(".jsonl.zst") {
+                        stem
+                    } else if let Some(stem) = s.strip_suffix(".jsonl") {
+                        stem
+                    } else {
+                        continue;
+                    };
+                    let dst_zst = dst_dir.join(format!("{stem}.{JSONL_EXT}.{ZST_EXT}"));
+                    let size = migrate_one(&e.path(), &dst_zst, dry_run)?;
+                    count += 1;
+                    bytes += size;
+                }
+            }
+        }
+        Layout::Mixed => {
+            return Err(io::Error::other(format!(
+                "{} contains both top-level sessions and subdirectories; \
+                 can't auto-migrate. Reorganise manually first.",
+                from.display()
+            )));
+        }
+    }
+    Ok((count, bytes))
+}
+
+fn cmd_migrate_store(from: &str, dry_run: bool) -> io::Result<()> {
+    let from_path = expand_tilde(from);
+    // If `from` is a symlink, resolve to target and use the symlink name as project.
+    let (canonical_from, into_subdir) = if from_path.is_symlink() {
+        let target = fs::canonicalize(&from_path)?;
+        let name = from_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from);
+        (target, name)
+    } else {
+        (from_path.clone(), None)
+    };
+    if !canonical_from.is_dir() {
+        return Err(io::Error::other(format!(
+            "source not found: {}",
+            from_path.display()
+        )));
+    }
+    let store = store_dir()?;
+    fs::create_dir_all(&store)?;
+    let (count, bytes) = migrate_dir(&canonical_from, into_subdir.as_deref(), &store, dry_run)?;
     println!(
-        "{} {moved} files ({})",
-        if dry_run { "would move" } else { "moved" },
+        "{} {count} files ({})",
+        if dry_run { "would migrate" } else { "migrated" },
         fmt_size(bytes)
     );
     Ok(())
@@ -559,10 +686,96 @@ fn cmd_migrate_store(from: &str, dry_run: bool) -> io::Result<()> {
 
 // ── Install (v0.2: systemd user service) ────────────────────────────────────
 
-#[cfg(target_os = "linux")]
 const SYSTEMD_UNIT: &str = include_str!("../systemd/claude-cellar.service");
 
-#[cfg(target_os = "linux")]
+/// Inspect ~/.claude/projects/ and decide where the store should live.
+/// Returns (chosen_store, optional pre-flight migration to do).
+///
+/// Heuristic:
+/// - mount-dir absent or empty → default store (XDG_DATA_HOME/claude-cellar/store).
+/// - mount-dir contains exactly one symlink (typical NFS-shared layout):
+///       use the symlink target as the store; migration project name is the
+///       symlink's basename. The symlink is removed (FUSE replaces it).
+/// - mount-dir contains real subdirs / files → default store; migrate from
+///   the mount-dir into it.
+fn plan_store_and_migration(mount_dir_path: &Path) -> io::Result<(PathBuf, Option<MigrationPlan>)> {
+    let default_store = store_dir()?;
+    if !mount_dir_path.exists() || !mount_dir_path.is_dir() {
+        return Ok((default_store, None));
+    }
+
+    let entries: Vec<_> = fs::read_dir(mount_dir_path)?.flatten().collect();
+    if entries.is_empty() {
+        return Ok((default_store, None));
+    }
+
+    // Heuristic: if there is exactly one sub-symlink, treat it as the
+    // canonical sessions location. Other entries (e.g. .bak directories)
+    // are left alone and will simply be hidden by the FUSE mount until
+    // umount.
+    let mut symlinks: Vec<_> = entries
+        .iter()
+        .filter(|e| e.path().is_symlink())
+        .collect();
+    if symlinks.len() == 1 {
+        let sym = symlinks.remove(0);
+        let target = fs::canonicalize(sym.path())?;
+        let name = sym
+            .file_name()
+            .to_str()
+            .ok_or_else(|| io::Error::other("symlink name not utf-8"))?
+            .to_string();
+        let other_count = entries.len() - 1;
+        if other_count > 0 {
+            println!(
+                "note: {} other entries in {} are not migrated and will be hidden \
+                 by the FUSE mount; uninstall to access them.",
+                other_count,
+                mount_dir_path.display()
+            );
+        }
+        return Ok((
+            target.clone(),
+            Some(MigrationPlan {
+                from: target,
+                into_subdir: Some(name.clone()),
+                remove_symlink: Some(sym.path()),
+            }),
+        ));
+    }
+
+    // Default store + migrate the entire mount-dir tree into it.
+    Ok((
+        default_store.clone(),
+        Some(MigrationPlan {
+            from: mount_dir_path.to_path_buf(),
+            into_subdir: None,
+            remove_symlink: None,
+        }),
+    ))
+}
+
+struct MigrationPlan {
+    from: PathBuf,
+    into_subdir: Option<String>,
+    remove_symlink: Option<PathBuf>,
+}
+
+fn execute_migration_plan(plan: &MigrationPlan, store: &Path) -> io::Result<()> {
+    println!(
+        "migrating sessions from {} → {}",
+        plan.from.display(),
+        store.display()
+    );
+    let (n, bytes) = migrate_dir(&plan.from, plan.into_subdir.as_deref(), store, false)?;
+    println!("migrated {n} sessions ({})", fmt_size(bytes));
+    if let Some(sym) = &plan.remove_symlink {
+        fs::remove_file(sym)?;
+        println!("removed symlink {} (FUSE will replace it)", sym.display());
+    }
+    Ok(())
+}
+
 fn cmd_install_v2(no_systemd: bool, claude_bin: Option<PathBuf>) -> io::Result<()> {
     if let Some(p) = claude_bin {
         if !p.exists() {
@@ -579,6 +792,29 @@ fn cmd_install_v2(no_systemd: bool, claude_bin: Option<PathBuf>) -> io::Result<(
         println!("claude binary auto-detected: {}", p.display());
     }
 
+    // Plan store + migration BEFORE writing the systemd unit, so the unit
+    // can hard-code CLAUDE_CELLAR_STORE_DIR if non-default.
+    let mp = mount_dir()?;
+    let (store, migration) = plan_store_and_migration(&mp)?;
+    let default_store = store_dir()?;
+    let store_is_default = store == default_store;
+
+    println!("store: {}", store.display());
+    println!(
+        "store layout: {}",
+        if store_is_default {
+            "default"
+        } else {
+            "custom (will be set in systemd unit)"
+        }
+    );
+
+    if let Some(plan) = &migration {
+        execute_migration_plan(plan, &store)?;
+    } else {
+        println!("no existing sessions to migrate");
+    }
+
     if no_systemd {
         println!("--no-systemd: skipping systemd registration.");
         println!("Manual mount: claude-cellar mount");
@@ -593,7 +829,19 @@ fn cmd_install_v2(no_systemd: bool, claude_bin: Option<PathBuf>) -> io::Result<(
     let unit_path = unit_dir.join("claude-cellar.service");
 
     let self_exe = std::env::current_exe()?;
-    let unit_text = SYSTEMD_UNIT.replace("{{CELLAR_BIN}}", &self_exe.display().to_string());
+    let mut unit_text = SYSTEMD_UNIT.replace("{{CELLAR_BIN}}", &self_exe.display().to_string());
+    if !store_is_default {
+        // Inject Environment line right after [Service]
+        let env_line = format!(
+            "Environment=CLAUDE_CELLAR_STORE_DIR={}",
+            store.display()
+        );
+        unit_text = unit_text.replacen(
+            "[Service]\n",
+            &format!("[Service]\n{env_line}\n"),
+            1,
+        );
+    }
     fs::write(&unit_path, unit_text)?;
     println!("systemd unit installed: {}", unit_path.display());
 
@@ -608,14 +856,37 @@ fn cmd_install_v2(no_systemd: bool, claude_bin: Option<PathBuf>) -> io::Result<(
             "systemctl enable --now failed (status {status})"
         )));
     }
-    println!("\nclaude-cellar.service enabled and started.");
-    println!("Mount active at {}.", mount_dir()?.display());
-    println!("\nUse `claude` as always. Run `claude-cellar status` for state.");
-    log_info(&format!("install v2 self_exe={}", self_exe.display()));
+
+    // Wait briefly and verify the FUSE actually mounted before claiming success.
+    let mut mounted = false;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if is_path_mounted_with_cellar(&mp) {
+            mounted = true;
+            break;
+        }
+    }
+    if !mounted {
+        eprintln!(
+            "WARNING: service started but the FUSE mount at {} is not yet visible.\n\
+             Run `claude-cellar status` and `journalctl --user -u claude-cellar.service`.",
+            mp.display()
+        );
+    } else {
+        println!("\nclaude-cellar.service enabled and started.");
+        println!("Mount active at {}.", mp.display());
+        println!("\nUse `claude` as always. Run `claude-cellar status` for state.");
+    }
+
+    log_info(&format!(
+        "install v2 self_exe={} store={} migration={}",
+        self_exe.display(),
+        store.display(),
+        migration.is_some()
+    ));
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn cmd_uninstall_v2() -> io::Result<()> {
     let _ = Command::new("systemctl")
         .args(["--user", "disable", "--now", "claude-cellar.service"])
@@ -825,7 +1096,6 @@ fn run(cli: Cli) -> io::Result<i32> {
             projects_dir,
             claude_bin,
         } => cmd_resume(&id, projects_dir, claude_bin)?,
-        #[cfg(target_os = "linux")]
         Subcmd::Mount {
             foreground,
             store_dir,
@@ -834,7 +1104,6 @@ fn run(cli: Cli) -> io::Result<i32> {
             cmd_mount(foreground, store_dir, mount_dir)?;
             0
         }
-        #[cfg(target_os = "linux")]
         Subcmd::Umount { mount_dir } => {
             cmd_umount(mount_dir)?;
             0
@@ -847,7 +1116,6 @@ fn run(cli: Cli) -> io::Result<i32> {
             cmd_migrate_store(&from, dry_run)?;
             0
         }
-        #[cfg(target_os = "linux")]
         Subcmd::Install {
             no_systemd,
             claude_bin,
@@ -855,7 +1123,6 @@ fn run(cli: Cli) -> io::Result<i32> {
             cmd_install_v2(no_systemd, claude_bin)?;
             0
         }
-        #[cfg(target_os = "linux")]
         Subcmd::Uninstall => {
             cmd_uninstall_v2()?;
             0

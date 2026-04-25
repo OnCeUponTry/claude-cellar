@@ -61,13 +61,10 @@ pub fn scratch_dir() -> io::Result<PathBuf> {
         fs::create_dir_all(&p)?;
         return Ok(p);
     }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
-            let p = PathBuf::from(rt).join("claude-cellar").join("scratch");
-            fs::create_dir_all(&p)?;
-            return Ok(p);
-        }
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let p = PathBuf::from(rt).join("claude-cellar").join("scratch");
+        fs::create_dir_all(&p)?;
+        return Ok(p);
     }
     let p = std::env::temp_dir().join("claude-cellar-scratch");
     fs::create_dir_all(&p)?;
@@ -127,18 +124,12 @@ pub fn sha256_zst(path: &Path) -> io::Result<[u8; 32]> {
 
 // ── Permissions ─────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 pub fn copy_permissions(src: &Path, dst: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mode = fs::metadata(src)?.permissions().mode();
     let mut perm = fs::metadata(dst)?.permissions();
     perm.set_mode(mode);
     fs::set_permissions(dst, perm)
-}
-
-#[cfg(not(unix))]
-pub fn copy_permissions(_src: &Path, _dst: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 // ── Single-file compress/decompress ─────────────────────────────────────────
