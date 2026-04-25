@@ -1,28 +1,28 @@
-use chrono::Utc;
+#[cfg(not(target_os = "linux"))]
+compile_error!("claude-cellar requires Linux (it depends on FUSE and fusermount3).");
+
+mod fuse;
+mod store;
+
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Instant, SystemTime};
 
-const ZSTD_LEVEL: i32 = 19;
-const JSONL_EXT: &str = "jsonl";
-const ZST_EXT: &str = "zst";
+use store::{
+    JSONL_EXT, ZST_EXT, append_ext, atomic_compress_to_store, claude_bin_config_file,
+    compress_file, config_dir, decompress_file, fmt_size, log_error, log_info, log_path,
+    mount_dir, scratch_dir, sidecar_path, store_dir,
+};
 
-type CompressResult = (
-    std::path::PathBuf,
-    std::io::Result<(std::path::PathBuf, u64, u64)>,
-);
+type CompressResult = (PathBuf, io::Result<(PathBuf, u64, u64)>);
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "Transparent zstd compression for Claude Code sessions"
-)]
+#[command(version, about = "Bundle-aware zstd compression for Claude Code sessions (Linux/FUSE)")]
 struct Cli {
     #[command(subcommand)]
     command: Subcmd,
@@ -59,22 +59,38 @@ enum Subcmd {
         #[arg(long)]
         claude_bin: Option<PathBuf>,
     },
-    /// Transparent wrapper: hydrate all compressed sessions, exec claude, re-compress on exit
-    Run {
-        /// Override projects root (default: $CLAUDE_CELLAR_PROJECTS_DIR or ~/.claude/projects)
+    /// Mount the FUSE filesystem (default: fork-and-exit; --foreground for systemd)
+    Mount {
         #[arg(long)]
-        projects_dir: Option<PathBuf>,
-        /// Arguments forwarded verbatim to claude
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<OsString>,
+        foreground: bool,
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
+        #[arg(long)]
+        mount_dir: Option<PathBuf>,
     },
-    /// Install the claude shim (replaces ~/.local/bin/claude with a wrapper)
+    /// Unmount the FUSE filesystem
+    Umount {
+        #[arg(long)]
+        mount_dir: Option<PathBuf>,
+    },
+    /// Print mount/store status
+    Status,
+    /// Migrate existing sessions (and their bundle dirs) into the store layout
+    MigrateStore {
+        #[arg(long, default_value = "~/.claude/projects")]
+        from: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Install: register and start the systemd user service. Auto-migrates
+    /// pre-existing sessions (with their sub-agent / tool-result bundle dirs).
     Install {
-        /// Explicit path to the real claude binary (auto-detected if omitted)
+        #[arg(long)]
+        no_systemd: bool,
         #[arg(long)]
         claude_bin: Option<PathBuf>,
     },
-    /// Revert install: restore the original claude binary in PATH
+    /// Uninstall: stop the systemd service. Store is preserved.
     Uninstall,
     /// Print the claude-cellar log
     Log {
@@ -83,167 +99,49 @@ enum Subcmd {
     },
 }
 
-fn append_ext(p: &Path, ext: &str) -> PathBuf {
-    let mut s: OsString = p.as_os_str().into();
-    s.push(".");
-    s.push(ext);
-    PathBuf::from(s)
-}
+// ── Mount detection ─────────────────────────────────────────────────────────
 
-fn strip_zst(p: &Path) -> Option<PathBuf> {
-    let s = p.to_str()?;
-    s.strip_suffix(".zst").map(PathBuf::from)
-}
-
-fn default_projects_dir() -> io::Result<PathBuf> {
-    if let Ok(custom) = std::env::var("CLAUDE_CELLAR_PROJECTS_DIR")
-        && !custom.is_empty()
-    {
-        return Ok(PathBuf::from(custom));
-    }
-    let home =
-        dirs::home_dir().ok_or_else(|| io::Error::other("could not resolve home directory"))?;
-    Ok(home.join(".claude").join("projects"))
-}
-
-fn scratch_dir() -> io::Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
-            let p = PathBuf::from(rt).join("claude-cellar").join("scratch");
-            fs::create_dir_all(&p)?;
-            return Ok(p);
-        }
-    }
-    let p = std::env::temp_dir().join("claude-cellar-scratch");
-    fs::create_dir_all(&p)?;
-    Ok(p)
-}
-
-fn config_dir() -> io::Result<PathBuf> {
-    let base =
-        dirs::config_dir().ok_or_else(|| io::Error::other("could not resolve config dir"))?;
-    let p = base.join("claude-cellar");
-    fs::create_dir_all(&p)?;
-    Ok(p)
-}
-
-fn claude_bin_config_file() -> io::Result<PathBuf> {
-    Ok(config_dir()?.join("claude-bin.path"))
-}
-
-fn log_path() -> Option<PathBuf> {
-    let base = dirs::state_dir().or_else(dirs::data_local_dir)?;
-    Some(base.join("claude-cellar").join("cellar.log"))
-}
-
-fn sha256_reader<R: Read>(mut r: R) -> io::Result<[u8; 32]> {
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = r.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize().into())
-}
-
-fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
-    sha256_reader(BufReader::new(File::open(path)?))
-}
-
-fn sha256_zst(path: &Path) -> io::Result<[u8; 32]> {
-    sha256_reader(zstd::stream::Decoder::new(BufReader::new(File::open(
-        path,
-    )?))?)
-}
-
-#[cfg(unix)]
-fn copy_permissions(src: &Path, dst: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(src)?.permissions().mode();
-    let mut perm = fs::metadata(dst)?.permissions();
-    perm.set_mode(mode);
-    fs::set_permissions(dst, perm)
-}
-
-#[cfg(not(unix))]
-fn copy_permissions(_src: &Path, _dst: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-fn log(level: &str, msg: &str) {
-    let Some(path) = log_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-    let line = format!("{ts} {level:<5} {msg}\n");
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = f.write_all(line.as_bytes());
-    }
-}
-
-fn log_info(msg: &str) {
-    log("INFO", msg);
-}
-fn log_error(msg: &str) {
-    log("ERROR", msg);
-}
-
-fn compress_file(src: &Path, keep_original: bool) -> io::Result<(PathBuf, u64, u64)> {
-    let dst = append_ext(src, ZST_EXT);
-
-    {
-        let in_f = BufReader::new(File::open(src)?);
-        let out_f = BufWriter::new(File::create(&dst)?);
-        let mut enc = zstd::stream::Encoder::new(out_f, ZSTD_LEVEL)?;
-        let mut reader = in_f;
-        io::copy(&mut reader, &mut enc)?;
-        enc.finish()?;
-    }
-
-    copy_permissions(src, &dst)?;
-
-    let src_hash = sha256_file(src)?;
-    let zst_hash = sha256_zst(&dst)?;
-    if src_hash != zst_hash {
-        let _ = fs::remove_file(&dst);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "verify failed: round-trip hash mismatch (zst removed, original kept)",
-        ));
-    }
-
-    let orig_size = fs::metadata(src)?.len();
-    let new_size = fs::metadata(&dst)?.len();
-
-    if !keep_original {
-        fs::remove_file(src)?;
-    }
-
-    Ok((dst, orig_size, new_size))
-}
-
-fn decompress_file(src: &Path, out: Option<&Path>) -> io::Result<PathBuf> {
-    let dst = match out {
-        Some(p) => p.to_path_buf(),
-        None => strip_zst(src)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "input must end in .zst"))?,
+fn is_path_mounted_with_cellar(path: &Path) -> bool {
+    let canon = match fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => return false,
     };
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
+    let target = canon.to_string_lossy().into_owned();
+    let Ok(f) = File::open("/proc/self/mountinfo") else {
+        return false;
+    };
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
+        let mut it = line.split_whitespace();
+        let _ = it.next();
+        let _ = it.next();
+        let _ = it.next();
+        let _ = it.next();
+        let mp = match it.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        if mp != target {
+            continue;
+        }
+        let mut found_sep = false;
+        for tok in it.by_ref() {
+            if tok == "-" {
+                found_sep = true;
+                break;
+            }
+        }
+        if !found_sep {
+            continue;
+        }
+        let fstype = it.next().unwrap_or("");
+        if fstype.starts_with("fuse") && line.contains("claude-cellar") {
+            return true;
+        }
     }
-    let in_f = BufReader::new(File::open(src)?);
-    let out_f = BufWriter::new(File::create(&dst)?);
-    let mut dec = zstd::stream::Decoder::new(in_f)?;
-    let mut writer = out_f;
-    io::copy(&mut dec, &mut writer)?;
-    copy_permissions(src, &dst).ok();
-    Ok(dst)
+    false
 }
+
+// ── Single-file commands ────────────────────────────────────────────────────
 
 fn list_dir(dir: &Path) -> io::Result<()> {
     let mut entries: Vec<_> = fs::read_dir(dir)?
@@ -267,6 +165,8 @@ fn list_dir(dir: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+
+// ── Archive ─────────────────────────────────────────────────────────────────
 
 fn collect_jsonl_sessions(root: &Path) -> io::Result<Vec<(PathBuf, SystemTime)>> {
     let mut out = Vec::new();
@@ -292,30 +192,19 @@ fn walk_jsonl(dir: &Path, out: &mut Vec<(PathBuf, SystemTime)>) -> io::Result<()
     Ok(())
 }
 
-fn fmt_size(n: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if n >= GB {
-        format!("{:.1} GB", n as f64 / GB as f64)
-    } else if n >= MB {
-        format!("{:.1} MB", n as f64 / MB as f64)
-    } else if n >= KB {
-        format!("{:.1} KB", n as f64 / KB as f64)
-    } else {
-        format!("{n} B")
-    }
-}
-
 fn cmd_archive(dir: &Path, keep: usize, dry_run: bool) -> io::Result<()> {
+    if is_path_mounted_with_cellar(dir) {
+        return Err(io::Error::other(format!(
+            "{} is mounted by claude-cellar; stop the daemon first (claude-cellar umount).",
+            dir.display()
+        )));
+    }
     let start = Instant::now();
     let mut sessions = collect_jsonl_sessions(dir)?;
     sessions.sort_by(|a, b| b.1.cmp(&a.1));
-
     let total = sessions.len();
     let split = keep.min(total);
     let (hot, cold) = sessions.split_at(split);
-
     println!("scan: {} .jsonl in {}", total, dir.display());
     println!("HOT (keep uncompressed, {}):", hot.len());
     for (p, _) in hot {
@@ -325,25 +214,18 @@ fn cmd_archive(dir: &Path, keep: usize, dry_run: bool) -> io::Result<()> {
     for (p, _) in cold {
         println!("  {}", p.file_name().unwrap_or_default().to_string_lossy());
     }
-
     if dry_run {
         println!("\n[dry-run, nothing changed]");
         return Ok(());
     }
     if cold.is_empty() {
-        log_info(&format!(
-            "archive dir={} keep={keep} total={total} cold=0",
-            dir.display()
-        ));
         println!("\nnothing to compress.");
         return Ok(());
     }
-
     let results: Vec<CompressResult> = cold
         .par_iter()
         .map(|(p, _)| (p.clone(), compress_file(p, false)))
         .collect();
-
     let mut ok = 0usize;
     let mut fail = 0usize;
     let mut total_before: u64 = 0;
@@ -367,33 +249,26 @@ fn cmd_archive(dir: &Path, keep: usize, dry_run: bool) -> io::Result<()> {
             Err(e) => {
                 fail += 1;
                 eprintln!("  FAIL  {}: {}", src.display(), e);
-                log_error(&format!("archive compress {}: {}", src.display(), e));
             }
         }
     }
-
     let saved = total_before.saturating_sub(total_after);
     let elapsed = start.elapsed();
     println!(
         "\ndone: {ok} compressed, {fail} failed, {} saved, {elapsed:.1?}",
         fmt_size(saved)
     );
-    log_info(&format!(
-        "archive dir={} keep={keep} total={total} cold={} ok={ok} fail={fail} saved={} elapsed={elapsed:?}",
-        dir.display(),
-        cold.len(),
-        fmt_size(saved)
-    ));
     if fail > 0 {
         return Err(io::Error::other(format!("{fail} compressions failed")));
     }
     Ok(())
 }
 
+// ── Resume ──────────────────────────────────────────────────────────────────
+
 fn find_session(projects: &Path, id: &str) -> io::Result<(PathBuf, bool)> {
     let raw_name = format!("{id}.{JSONL_EXT}");
     let zst_name = format!("{id}.{JSONL_EXT}.{ZST_EXT}");
-
     let direct_raw = projects.join(&raw_name);
     if direct_raw.is_file() {
         return Ok((direct_raw, false));
@@ -402,7 +277,6 @@ fn find_session(projects: &Path, id: &str) -> io::Result<(PathBuf, bool)> {
     if direct_zst.is_file() {
         return Ok((direct_zst, true));
     }
-
     for entry in fs::read_dir(projects)? {
         let entry = entry?;
         let p = entry.path();
@@ -418,260 +292,519 @@ fn find_session(projects: &Path, id: &str) -> io::Result<(PathBuf, bool)> {
             return Ok((zst, true));
         }
     }
-
     Err(io::Error::new(
         io::ErrorKind::NotFound,
         format!("session {id} not found under {}", projects.display()),
     ))
 }
 
-fn cmd_resume(
-    id: &str,
-    projects_dir: Option<PathBuf>,
-    claude_bin: Option<PathBuf>,
-) -> io::Result<i32> {
-    let start = Instant::now();
+fn cmd_resume(id: &str, projects_dir: Option<PathBuf>, claude_bin: Option<PathBuf>) -> io::Result<i32> {
     let projects = projects_dir.map_or_else(default_projects_dir, Ok)?;
     let (found, is_compressed) = find_session(&projects, id)?;
-
-    let (path_to_resume, scratch_to_clean, source) = if is_compressed {
+    let (path_to_resume, scratch_to_clean) = if is_compressed {
         let scratch = scratch_dir()?;
         let dst = scratch.join(format!("{id}.{JSONL_EXT}"));
         decompress_file(&found, Some(&dst))?;
-        (dst.clone(), Some(dst), "zst")
+        (dst.clone(), Some(dst))
     } else {
-        (found.clone(), None, "raw")
+        (found.clone(), None)
     };
-
     let claude = claude_bin.map_or_else(resolve_claude_bin, Ok)?;
-
-    log_info(&format!(
-        "resume start id={id} source={source} found={} path={} claude={}",
-        found.display(),
-        path_to_resume.display(),
-        claude.display()
-    ));
-    println!("claude-cellar: resuming {id} ({source})");
-
+    println!(
+        "claude-cellar: resuming {id} ({})",
+        if is_compressed { "zst" } else { "raw" }
+    );
     let status = Command::new(&claude)
         .arg("--resume")
         .arg(&path_to_resume)
         .status()?;
     let exit = status.code().unwrap_or(-1);
-
-    if let Some(p) = &scratch_to_clean
-        && let Err(e) = fs::remove_file(p)
-    {
-        log_error(&format!("resume cleanup failed: {} ({e})", p.display()));
+    if let Some(p) = &scratch_to_clean {
+        let _ = fs::remove_file(p);
     }
-
-    log_info(&format!(
-        "resume end   id={id} source={source} claude_exit={exit} elapsed={:?}",
-        start.elapsed()
-    ));
-
     Ok(exit)
 }
 
-struct Hydrated {
-    jsonl: PathBuf,
-    size: u64,
-    mtime: SystemTime,
+// ── Mount/umount/status ─────────────────────────────────────────────────────
+
+fn cmd_mount(
+    foreground: bool,
+    store_dir_arg: Option<PathBuf>,
+    mount_dir_arg: Option<PathBuf>,
+) -> io::Result<()> {
+    let store = store_dir_arg.map_or_else(store_dir, Ok)?;
+    let mount = mount_dir_arg.map_or_else(mount_dir, Ok)?;
+    if is_path_mounted_with_cellar(&mount) {
+        if foreground {
+            return Err(io::Error::other(format!(
+                "{} already has a claude-cellar mount; refusing.",
+                mount.display()
+            )));
+        }
+        eprintln!("claude-cellar: already mounted at {}", mount.display());
+        return Ok(());
+    }
+    fuse::run_mount(foreground, store, mount)
 }
 
-fn collect_zst_without_jsonl(root: &Path) -> io::Result<Vec<(PathBuf, PathBuf)>> {
-    let mut out = Vec::new();
-    walk_zst(root, &mut out)?;
-    Ok(out)
+fn cmd_umount(mount_dir_arg: Option<PathBuf>) -> io::Result<()> {
+    let mount = mount_dir_arg.map_or_else(mount_dir, Ok)?;
+    if !is_path_mounted_with_cellar(&mount) {
+        println!("claude-cellar: nothing to unmount at {}", mount.display());
+        return Ok(());
+    }
+    let status = Command::new("fusermount3").arg("-u").arg(&mount).status()?;
+    if !status.success() {
+        return Err(io::Error::other("fusermount3 -u failed"));
+    }
+    println!("claude-cellar: unmounted {}", mount.display());
+    Ok(())
 }
 
-fn walk_zst(dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) -> io::Result<()> {
-    for e in fs::read_dir(dir)? {
-        let e = e?;
-        let ft = e.file_type()?;
-        if ft.is_dir() {
-            walk_zst(&e.path(), out)?;
-        } else if ft.is_file() {
-            let name = e.file_name();
-            let s = name.to_string_lossy();
-            if s.ends_with(".jsonl.zst") {
-                let zst = e.path();
-                let Some(jsonl_str) = zst.to_string_lossy().strip_suffix(".zst").map(String::from)
-                else {
-                    continue;
-                };
-                let jsonl = PathBuf::from(jsonl_str);
-                if !jsonl.exists() {
-                    out.push((zst, jsonl));
+fn cmd_status() -> io::Result<()> {
+    let store = store_dir()?;
+    let mount = mount_dir()?;
+    println!("store:  {}", store.display());
+    println!("mount:  {}", mount.display());
+    let mounted = is_path_mounted_with_cellar(&mount);
+    println!("active: {}", if mounted { "yes" } else { "no" });
+    if let Ok(pid) = fs::read_to_string(store::pid_file()?) {
+        println!("pid:    {}", pid.trim());
+    }
+    if store.is_dir() {
+        let mut count = 0u64;
+        let mut bytes = 0u64;
+        if let Ok(rd) = fs::read_dir(&store) {
+            for proj in rd.flatten() {
+                if proj.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && let Ok(rd2) = fs::read_dir(proj.path())
+                {
+                    for e in rd2.flatten() {
+                        if let Ok(m) = e.metadata()
+                            && m.is_file()
+                            && e.file_name().to_string_lossy().ends_with(".zst")
+                        {
+                            count += 1;
+                            bytes += m.len();
+                        }
+                    }
                 }
             }
         }
+        println!(
+            "store contents: {count} sessions, {} compressed",
+            fmt_size(bytes)
+        );
     }
     Ok(())
 }
 
-fn hydrate_parallel(dir: &Path) -> io::Result<Vec<Hydrated>> {
-    let pairs = collect_zst_without_jsonl(dir)?;
-    let results: Vec<io::Result<Hydrated>> = pairs
-        .par_iter()
-        .map(|(zst, jsonl)| {
-            decompress_file(zst, Some(jsonl))?;
-            let meta = fs::metadata(jsonl)?;
-            Ok(Hydrated {
-                jsonl: jsonl.clone(),
-                size: meta.len(),
-                mtime: meta.modified()?,
-            })
-        })
-        .collect();
-    let mut out = Vec::with_capacity(results.len());
-    for r in results {
-        out.push(r?);
+// ── Migrate (bundle-aware) ──────────────────────────────────────────────────
+
+fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
-    Ok(out)
+    PathBuf::from(s)
 }
 
-fn cleanup_hydrated_parallel(entries: &[Hydrated]) -> (usize, usize, usize) {
-    // returns (unchanged_deleted, recompressed, errors)
-    let counts: Vec<(usize, usize, usize)> = entries
-        .par_iter()
-        .map(|e| {
-            if !e.jsonl.exists() {
-                return (0, 0, 0);
+#[derive(Debug, PartialEq, Eq)]
+enum Layout {
+    Empty,
+    /// Sessions live as `<uuid>.jsonl` (raw or .zst) at the top, optionally
+    /// with sibling `<uuid>/` bundle dirs. The classic NFS-shared layout
+    /// after symlink resolution.
+    Flat,
+    /// Top-level subdirs are full Claude project directories.
+    Projected,
+}
+
+fn detect_layout(dir: &Path) -> io::Result<Layout> {
+    let mut top_jsonl = false;
+    let mut subdir_jsonl = false;
+    for e in fs::read_dir(dir)?.flatten() {
+        let ft = match e.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_file() {
+            let s = e.file_name().to_string_lossy().into_owned();
+            if s.ends_with(".jsonl") || s.ends_with(".jsonl.zst") {
+                top_jsonl = true;
             }
-            let meta = match fs::metadata(&e.jsonl) {
-                Ok(m) => m,
-                Err(err) => {
-                    log_error(&format!("cleanup stat {}: {err}", e.jsonl.display()));
-                    return (0, 0, 1);
-                }
-            };
-            let changed = meta.len() != e.size || meta.modified().ok().is_none_or(|t| t != e.mtime);
-            if changed {
-                match compress_file(&e.jsonl, false) {
-                    Ok(_) => (0, 1, 0),
-                    Err(err) => {
-                        log_error(&format!("cleanup compress {}: {err}", e.jsonl.display()));
-                        (0, 0, 1)
+        } else if ft.is_dir()
+            && let Ok(rd) = fs::read_dir(e.path())
+        {
+            for inner in rd.flatten() {
+                if inner.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    let s = inner.file_name().to_string_lossy().into_owned();
+                    if s.ends_with(".jsonl") || s.ends_with(".jsonl.zst") {
+                        subdir_jsonl = true;
+                        break;
                     }
                 }
-            } else if let Err(err) = fs::remove_file(&e.jsonl) {
-                log_error(&format!("cleanup rm {}: {err}", e.jsonl.display()));
-                (0, 0, 1)
-            } else {
-                (1, 0, 0)
             }
-        })
-        .collect();
-    counts
-        .into_iter()
-        .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+            if subdir_jsonl {
+                break;
+            }
+        }
+    }
+    Ok(if top_jsonl {
+        Layout::Flat
+    } else if subdir_jsonl {
+        Layout::Projected
+    } else {
+        Layout::Empty
+    })
 }
 
-fn cmd_run(projects_dir: Option<PathBuf>, claude_args: Vec<OsString>) -> io::Result<i32> {
-    let start = Instant::now();
-    let projects = projects_dir.map_or_else(default_projects_dir, Ok)?;
-    let claude = resolve_claude_bin()?;
+/// Move/compress one session bundle (jsonl + sibling dir + sidecar).
+/// `src_jsonl` may be either `<x>.jsonl` (raw) or `<x>.jsonl.zst`.
+/// `dst_zst` is the target `<x>.jsonl.zst` in the store layout.
+/// If a sibling dir `<x>/` exists, it is moved to the same parent as
+/// `dst_zst` with the same stem.
+fn migrate_one_bundle(src_jsonl_or_zst: &Path, dst_zst: &Path, dry_run: bool) -> io::Result<u64> {
+    let src_name = src_jsonl_or_zst
+        .file_name()
+        .ok_or_else(|| io::Error::other("no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let parent_src = src_jsonl_or_zst
+        .parent()
+        .ok_or_else(|| io::Error::other("no parent"))?;
+    let parent_dst = dst_zst
+        .parent()
+        .ok_or_else(|| io::Error::other("no parent"))?;
 
-    let t0 = Instant::now();
-    let hydrated = hydrate_parallel(&projects)?;
-    let hydrate_ms = t0.elapsed().as_millis();
-    log_info(&format!(
-        "run hydrate dir={} count={} elapsed_ms={hydrate_ms}",
-        projects.display(),
-        hydrated.len()
-    ));
+    // Determine stem (without .jsonl or .jsonl.zst).
+    let stem = if let Some(s) = src_name.strip_suffix(".jsonl.zst") {
+        s.to_string()
+    } else if let Some(s) = src_name.strip_suffix(".jsonl") {
+        s.to_string()
+    } else {
+        return Err(io::Error::other(format!(
+            "not a session file: {}",
+            src_jsonl_or_zst.display()
+        )));
+    };
+    let size = src_jsonl_or_zst.metadata()?.len();
 
-    // Spawn child, then survive SIGINT/SIGTERM/SIGHUP so we can cleanup.
-    let mut child = Command::new(&claude).args(&claude_args).spawn()?;
+    if dry_run {
+        let kind = if src_name.ends_with(".jsonl.zst") {
+            "move"
+        } else {
+            "compress+move"
+        };
+        println!("would {kind} {} -> {}", src_jsonl_or_zst.display(), dst_zst.display());
+        let sib_src = parent_src.join(&stem);
+        if sib_src.is_dir() {
+            let sib_dst = parent_dst.join(&stem);
+            println!("would mv-dir {} -> {}", sib_src.display(), sib_dst.display());
+        }
+        return Ok(size);
+    }
 
-    #[cfg(unix)]
-    let sig_handle = {
-        let child_pid = child.id();
-        use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
-        use signal_hook::iterator::Signals;
-        let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
-        let handle = signals.handle();
-        std::thread::spawn(move || {
-            for sig in signals.forever() {
-                unsafe {
-                    libc::kill(child_pid as libc::pid_t, sig);
+    fs::create_dir_all(parent_dst)?;
+
+    // 1) The session file.
+    if src_name.ends_with(".jsonl.zst") {
+        // Already compressed; just rename. Same with sidecar if present.
+        if dst_zst != src_jsonl_or_zst {
+            fs::rename(src_jsonl_or_zst, dst_zst)?;
+            let src_meta = sidecar_path(src_jsonl_or_zst);
+            let dst_meta = sidecar_path(dst_zst);
+            let _ = fs::rename(&src_meta, &dst_meta);
+        }
+    } else {
+        atomic_compress_to_store(src_jsonl_or_zst, dst_zst)?;
+        fs::remove_file(src_jsonl_or_zst)?;
+    }
+
+    // 2) The sibling bundle dir, if any.
+    let sib_src = parent_src.join(&stem);
+    let sib_dst = parent_dst.join(&stem);
+    if sib_src.is_dir() && sib_src != sib_dst {
+        fs::rename(&sib_src, &sib_dst)?;
+    }
+
+    Ok(size)
+}
+
+fn migrate_dir(
+    from: &Path,
+    into_subdir: Option<&str>,
+    store: &Path,
+    dry_run: bool,
+) -> io::Result<(usize, u64)> {
+    let layout = detect_layout(from)?;
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    match layout {
+        Layout::Empty => {
+            println!("source is empty; nothing to migrate");
+        }
+        Layout::Flat => {
+            let proj = into_subdir.ok_or_else(|| {
+                io::Error::other("flat source needs --into-subdir / symlink name")
+            })?;
+            let dst_dir = store.join(proj);
+            // Snapshot entries up-front because we'll be moving things.
+            let entries: Vec<_> = fs::read_dir(from)?.flatten().collect();
+            for e in entries {
+                let ft = match e.file_type() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if !ft.is_file() {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().into_owned();
+                let stem = if let Some(s) = name.strip_suffix(".jsonl.zst") {
+                    s.to_string()
+                } else if let Some(s) = name.strip_suffix(".jsonl") {
+                    s.to_string()
+                } else {
+                    continue;
+                };
+                let dst_zst = dst_dir.join(format!("{stem}.{JSONL_EXT}.{ZST_EXT}"));
+                let size = migrate_one_bundle(&e.path(), &dst_zst, dry_run)?;
+                count += 1;
+                bytes += size;
+            }
+        }
+        Layout::Projected => {
+            for proj in fs::read_dir(from)?.flatten() {
+                if !proj.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let proj_name = proj.file_name();
+                let dst_dir = store.join(&proj_name);
+                let inner_entries: Vec<_> = match fs::read_dir(proj.path()) {
+                    Ok(r) => r.flatten().collect(),
+                    Err(_) => continue,
+                };
+                for e in inner_entries {
+                    let ft = match e.file_type() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    if !ft.is_file() {
+                        continue;
+                    }
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let stem = if let Some(s) = name.strip_suffix(".jsonl.zst") {
+                        s.to_string()
+                    } else if let Some(s) = name.strip_suffix(".jsonl") {
+                        s.to_string()
+                    } else {
+                        continue;
+                    };
+                    let dst_zst = dst_dir.join(format!("{stem}.{JSONL_EXT}.{ZST_EXT}"));
+                    let size = migrate_one_bundle(&e.path(), &dst_zst, dry_run)?;
+                    count += 1;
+                    bytes += size;
                 }
             }
-        });
-        handle
-    };
-
-    #[cfg(windows)]
-    {
-        // Windows propagates Ctrl+C to all processes attached to the console.
-        // Register a no-op handler so the wrapper survives and can run cleanup;
-        // the child still receives the event and exits on its own.
-        let _ = ctrlc::try_set_handler(|| {});
+        }
     }
-
-    let status = child.wait()?;
-    #[cfg(unix)]
-    let exit = status.code().unwrap_or_else(|| {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal().map(|s| 128 + s).unwrap_or(-1)
-    });
-    #[cfg(not(unix))]
-    let exit = status.code().unwrap_or(-1);
-
-    #[cfg(unix)]
-    sig_handle.close();
-
-    let t1 = Instant::now();
-    let (kept_deleted, recompressed, errors) = cleanup_hydrated_parallel(&hydrated);
-    let cleanup_ms = t1.elapsed().as_millis();
-
-    log_info(&format!(
-        "run end claude_exit={exit} hydrated={} recompressed={recompressed} \
-         unchanged_deleted={kept_deleted} errors={errors} \
-         total_elapsed={:?} hydrate_ms={hydrate_ms} cleanup_ms={cleanup_ms}",
-        hydrated.len(),
-        start.elapsed()
-    ));
-
-    if errors > 0 {
-        eprintln!("claude-cellar: {errors} cleanup error(s); check `claude-cellar log`");
-    }
-
-    Ok(exit)
+    Ok((count, bytes))
 }
 
-fn canonical_claude_paths() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        let versions_dir = home
-            .join(".local")
-            .join("share")
-            .join("claude")
-            .join("versions");
-        if let Ok(rd) = fs::read_dir(&versions_dir) {
-            let mut vs: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-            vs.sort();
-            // reverse so newest last (lex sort on semver works for plain X.Y.Z)
-            if let Some(latest) = vs.into_iter().last() {
-                out.push(latest);
-            }
-        }
+fn cmd_migrate_store(from: &str, dry_run: bool) -> io::Result<()> {
+    let from_path = expand_tilde(from);
+    let (canonical, into_subdir) = if from_path.is_symlink() {
+        let target = fs::canonicalize(&from_path)?;
+        let name = from_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from);
+        (target, name)
+    } else {
+        (from_path.clone(), None)
+    };
+    if !canonical.is_dir() {
+        return Err(io::Error::other(format!("not a directory: {}", from_path.display())));
     }
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(local) = dirs::data_local_dir() {
-            out.push(local.join("Programs").join("claude").join("claude.exe"));
-        }
+    let store = store_dir()?;
+    fs::create_dir_all(&store)?;
+    let (count, bytes) = migrate_dir(&canonical, into_subdir.as_deref(), &store, dry_run)?;
+    println!(
+        "{} {count} bundles ({})",
+        if dry_run { "would migrate" } else { "migrated" },
+        fmt_size(bytes)
+    );
+    Ok(())
+}
+
+// ── Install ─────────────────────────────────────────────────────────────────
+
+const SYSTEMD_UNIT: &str = include_str!("../systemd/claude-cellar.service");
+
+struct MigrationPlan {
+    from: PathBuf,
+    into_subdir: Option<String>,
+    remove_symlink: Option<PathBuf>,
+}
+
+fn plan_install(mount_dir_path: &Path) -> io::Result<(PathBuf, Option<MigrationPlan>)> {
+    let default_store = store_dir()?;
+    if !mount_dir_path.exists() || !mount_dir_path.is_dir() {
+        return Ok((default_store, None));
     }
-    #[cfg(target_os = "macos")]
-    {
-        out.push(PathBuf::from(
-            "/Applications/Claude.app/Contents/MacOS/claude",
+    let entries: Vec<_> = fs::read_dir(mount_dir_path)?.flatten().collect();
+    if entries.is_empty() {
+        return Ok((default_store, None));
+    }
+    let mut symlinks: Vec<_> = entries.iter().filter(|e| e.path().is_symlink()).collect();
+    if symlinks.len() == 1 {
+        let sym = symlinks.remove(0);
+        let target = fs::canonicalize(sym.path())?;
+        let name = sym
+            .file_name()
+            .to_str()
+            .ok_or_else(|| io::Error::other("symlink name not utf-8"))?
+            .to_string();
+        let other = entries.len() - 1;
+        if other > 0 {
+            println!(
+                "note: {other} other entries in {} are not migrated and will be hidden by the FUSE mount; uninstall to access them.",
+                mount_dir_path.display()
+            );
+        }
+        return Ok((
+            target.clone(),
+            Some(MigrationPlan {
+                from: target,
+                into_subdir: Some(name.clone()),
+                remove_symlink: Some(sym.path()),
+            }),
         ));
     }
-    out
+    Ok((
+        default_store.clone(),
+        Some(MigrationPlan {
+            from: mount_dir_path.to_path_buf(),
+            into_subdir: None,
+            remove_symlink: None,
+        }),
+    ))
 }
+
+fn execute_plan(plan: &MigrationPlan, store: &Path) -> io::Result<()> {
+    println!("migrating bundles from {} → {}", plan.from.display(), store.display());
+    let (n, bytes) = migrate_dir(&plan.from, plan.into_subdir.as_deref(), store, false)?;
+    println!("migrated {n} bundles ({})", fmt_size(bytes));
+    if let Some(sym) = &plan.remove_symlink {
+        fs::remove_file(sym)?;
+        println!("removed symlink {} (FUSE replaces it)", sym.display());
+    }
+    Ok(())
+}
+
+fn cmd_install(no_systemd: bool, claude_bin: Option<PathBuf>) -> io::Result<()> {
+    if let Some(p) = claude_bin {
+        if !p.exists() {
+            return Err(io::Error::other(format!(
+                "--claude-bin not found: {}",
+                p.display()
+            )));
+        }
+        let canon = fs::canonicalize(&p)?;
+        write_stored_claude_bin(&canon)?;
+        println!("claude binary stored: {}", canon.display());
+    } else if let Ok(p) = resolve_claude_bin() {
+        write_stored_claude_bin(&p)?;
+        println!("claude binary auto-detected: {}", p.display());
+    }
+
+    let mp = mount_dir()?;
+    let (store, migration) = plan_install(&mp)?;
+    let default_store = store_dir()?;
+    let store_is_default = store == default_store;
+
+    println!("store: {}", store.display());
+    println!(
+        "store layout: {}",
+        if store_is_default { "default" } else { "custom" }
+    );
+
+    if let Some(plan) = &migration {
+        execute_plan(plan, &store)?;
+    } else {
+        println!("no existing sessions to migrate");
+    }
+
+    if no_systemd {
+        println!("--no-systemd: skipping systemd registration. Manual: claude-cellar mount");
+        return Ok(());
+    }
+
+    let unit_dir = dirs::config_dir()
+        .ok_or_else(|| io::Error::other("no XDG_CONFIG_HOME"))?
+        .join("systemd")
+        .join("user");
+    fs::create_dir_all(&unit_dir)?;
+    let unit_path = unit_dir.join("claude-cellar.service");
+    let self_exe = std::env::current_exe()?;
+    let mut unit = SYSTEMD_UNIT.replace("{{CELLAR_BIN}}", &self_exe.display().to_string());
+    if !store_is_default {
+        let line = format!("Environment=CLAUDE_CELLAR_STORE_DIR={}", store.display());
+        unit = unit.replacen("[Service]\n", &format!("[Service]\n{line}\n"), 1);
+    }
+    fs::write(&unit_path, unit)?;
+    println!("systemd unit installed: {}", unit_path.display());
+
+    let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+    let st = Command::new("systemctl")
+        .args(["--user", "enable", "--now", "claude-cellar.service"])
+        .status()?;
+    if !st.success() {
+        return Err(io::Error::other("systemctl enable --now failed"));
+    }
+
+    let mut mounted = false;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if is_path_mounted_with_cellar(&mp) {
+            mounted = true;
+            break;
+        }
+    }
+    if !mounted {
+        eprintln!(
+            "WARNING: service started but mount at {} not yet visible. Check `claude-cellar status` and `journalctl --user -u claude-cellar.service`.",
+            mp.display()
+        );
+    } else {
+        println!("\nclaude-cellar.service enabled and started.");
+        println!("Mount active at {}.", mp.display());
+        println!("\nUse `claude` as always. Run `claude-cellar status` for state.");
+    }
+    log_info(&format!("install store={} migration={}", store.display(), migration.is_some()));
+    Ok(())
+}
+
+fn cmd_uninstall() -> io::Result<()> {
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "--now", "claude-cellar.service"])
+        .status();
+    let unit_path = dirs::config_dir()
+        .ok_or_else(|| io::Error::other("no XDG_CONFIG_HOME"))?
+        .join("systemd")
+        .join("user")
+        .join("claude-cellar.service");
+    if unit_path.is_file() {
+        fs::remove_file(&unit_path)?;
+        println!("removed: {}", unit_path.display());
+    }
+    let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+    println!("\nclaude-cellar uninstalled. Store at {} is preserved.", store_dir()?.display());
+    Ok(())
+}
+
+// ── Claude binary discovery ─────────────────────────────────────────────────
 
 fn read_stored_claude_bin() -> io::Result<Option<PathBuf>> {
     let p = claude_bin_config_file()?;
@@ -687,33 +820,28 @@ fn read_stored_claude_bin() -> io::Result<Option<PathBuf>> {
 }
 
 fn write_stored_claude_bin(path: &Path) -> io::Result<()> {
+    let _ = config_dir()?;
     let p = claude_bin_config_file()?;
     fs::write(&p, format!("{}\n", path.display()))
 }
 
-fn shim_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| {
-        let name = if cfg!(windows) {
-            "claude.cmd"
-        } else {
-            "claude"
-        };
-        h.join(".local").join("bin").join(name)
-    })
-}
-
-fn is_our_shim(path: &Path) -> bool {
-    // Heuristic: our shim is a small file whose contents include "claude-cellar"
-    if let Ok(meta) = fs::metadata(path) {
-        if !meta.is_file() || meta.len() > 4096 {
-            return false;
+fn canonical_claude_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        let versions_dir = home
+            .join(".local")
+            .join("share")
+            .join("claude")
+            .join("versions");
+        if let Ok(rd) = fs::read_dir(&versions_dir) {
+            let mut vs: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+            vs.sort();
+            if let Some(latest) = vs.into_iter().last() {
+                out.push(latest);
+            }
         }
-    } else {
-        return false;
     }
-    fs::read_to_string(path)
-        .map(|s| s.contains("claude-cellar"))
-        .unwrap_or(false)
+    out
 }
 
 fn resolve_claude_bin() -> io::Result<PathBuf> {
@@ -726,7 +854,6 @@ fn resolve_claude_bin() -> io::Result<PathBuf> {
         return Ok(p);
     }
     let self_exe = std::env::current_exe().ok();
-    let shim = shim_path();
     for cand in canonical_claude_paths() {
         if !cand.exists() {
             continue;
@@ -738,141 +865,26 @@ fn resolve_claude_bin() -> io::Result<PathBuf> {
         {
             continue;
         }
-        if let Some(s) = &shim
-            && (&canon == s || &cand == s)
-        {
-            continue;
-        }
-        if is_our_shim(&cand) {
-            continue;
-        }
         return Ok(canon);
     }
-    Err(io::Error::other(
-        "claude binary not found; run `claude-cellar install` or set CLAUDE_CELLAR_CLAUDE_BIN",
-    ))
+    Err(io::Error::other("claude binary not found"))
 }
 
-#[cfg(unix)]
-fn write_shim(shim_path: &Path, cellar_self: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let content = format!(
-        "#!/usr/bin/env bash\nexec \"{}\" run -- \"$@\"\n",
-        cellar_self.display()
-    );
-    if let Some(parent) = shim_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(shim_path, content)?;
-    let mut perm = fs::metadata(shim_path)?.permissions();
-    perm.set_mode(0o755);
-    fs::set_permissions(shim_path, perm)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn write_shim(shim_path: &Path, cellar_self: &Path) -> io::Result<()> {
-    let content = format!("@echo off\r\n\"{}\" run -- %*\r\n", cellar_self.display());
-    if let Some(parent) = shim_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(shim_path, content)?;
-    Ok(())
-}
-
-fn cmd_install(claude_bin: Option<PathBuf>) -> io::Result<()> {
-    let self_exe = std::env::current_exe()?;
-    let shim = shim_path().ok_or_else(|| io::Error::other("cannot resolve shim path"))?;
-
-    // 1. figure out real claude bin
-    let real = match claude_bin {
-        Some(p) => {
-            if !p.exists() {
-                return Err(io::Error::other(format!(
-                    "provided --claude-bin does not exist: {}",
-                    p.display()
-                )));
-            }
-            fs::canonicalize(&p)?
-        }
-        None => {
-            if shim.exists() && is_our_shim(&shim) {
-                // shim already installed; rely on config
-                if let Some(p) = read_stored_claude_bin()? {
-                    p
-                } else {
-                    return Err(io::Error::other(
-                        "shim already installed but no config; pass --claude-bin",
-                    ));
-                }
-            } else if shim.exists() && shim.is_symlink() {
-                let target = fs::canonicalize(&shim)?;
-                if target == self_exe {
-                    return Err(io::Error::other(
-                        "shim is this binary already; pass --claude-bin to reinstall",
-                    ));
-                }
-                target
-            } else if shim.is_file() {
-                fs::canonicalize(&shim)?
-            } else {
-                // last resort: canonical paths
-                resolve_claude_bin()?
-            }
-        }
-    };
-
-    println!("real claude binary: {}", real.display());
-    write_stored_claude_bin(&real)?;
-    println!("saved to config: {}", claude_bin_config_file()?.display());
-
-    // 2. replace shim
-    if shim.exists() || shim.is_symlink() {
-        fs::remove_file(&shim).ok();
-    }
-    write_shim(&shim, &self_exe)?;
-    println!("shim installed at: {}", shim.display());
-    log_info(&format!(
-        "install shim={} real={} self_exe={}",
-        shim.display(),
-        real.display(),
-        self_exe.display()
-    ));
-    println!("\nDone. `claude ...` now runs claude-cellar run transparently.");
-    Ok(())
-}
-
-fn cmd_uninstall() -> io::Result<()> {
-    let shim = shim_path().ok_or_else(|| io::Error::other("cannot resolve shim path"))?;
-    let real = read_stored_claude_bin()?;
-
-    if shim.exists() && is_our_shim(&shim) {
-        fs::remove_file(&shim)?;
-        println!("shim removed: {}", shim.display());
-    } else if shim.exists() {
-        println!(
-            "warning: {} exists but is not our shim; not touching",
-            shim.display()
-        );
-    }
-
-    if let Some(real_path) = real
-        && real_path.exists()
+fn default_projects_dir() -> io::Result<PathBuf> {
+    if let Ok(custom) = std::env::var("CLAUDE_CELLAR_PROJECTS_DIR")
+        && !custom.is_empty()
     {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real_path, &shim)?;
-        #[cfg(not(unix))]
-        fs::copy(&real_path, &shim).map(|_| ())?;
-        println!("restored {} -> {}", shim.display(), real_path.display());
+        return Ok(PathBuf::from(custom));
     }
-
-    log_info("uninstall done");
-    Ok(())
+    let home = dirs::home_dir().ok_or_else(|| io::Error::other("no home"))?;
+    Ok(home.join(".claude").join("projects"))
 }
+
+// ── Log ─────────────────────────────────────────────────────────────────────
 
 fn cmd_log(tail: usize) -> io::Result<()> {
     let Some(path) = log_path() else {
-        eprintln!("no log path on this platform");
+        eprintln!("no log path");
         return Ok(());
     };
     if !path.is_file() {
@@ -892,6 +904,8 @@ fn cmd_log(tail: usize) -> io::Result<()> {
     Ok(())
 }
 
+// ── Dispatch ────────────────────────────────────────────────────────────────
+
 fn run(cli: Cli) -> io::Result<i32> {
     Ok(match cli.command {
         Subcmd::Compress { file, keep } => {
@@ -903,21 +917,12 @@ fn run(cli: Cli) -> io::Result<i32> {
                 fmt_size(after),
                 after as f64 * 100.0 / before as f64
             );
-            log_info(&format!(
-                "compress file={} out={} before={before} after={after}",
-                file.display(),
-                dst.display()
-            ));
+            let _ = append_ext;
             0
         }
         Subcmd::Decompress { file, output } => {
             let dst = decompress_file(&file, output.as_deref())?;
             println!("decompressed -> {}", dst.display());
-            log_info(&format!(
-                "decompress file={} out={}",
-                file.display(),
-                dst.display()
-            ));
             0
         }
         Subcmd::List { dir } => {
@@ -933,9 +938,31 @@ fn run(cli: Cli) -> io::Result<i32> {
             projects_dir,
             claude_bin,
         } => cmd_resume(&id, projects_dir, claude_bin)?,
-        Subcmd::Run { projects_dir, args } => cmd_run(projects_dir, args)?,
-        Subcmd::Install { claude_bin } => {
-            cmd_install(claude_bin)?;
+        Subcmd::Mount {
+            foreground,
+            store_dir,
+            mount_dir,
+        } => {
+            cmd_mount(foreground, store_dir, mount_dir)?;
+            0
+        }
+        Subcmd::Umount { mount_dir } => {
+            cmd_umount(mount_dir)?;
+            0
+        }
+        Subcmd::Status => {
+            cmd_status()?;
+            0
+        }
+        Subcmd::MigrateStore { from, dry_run } => {
+            cmd_migrate_store(&from, dry_run)?;
+            0
+        }
+        Subcmd::Install {
+            no_systemd,
+            claude_bin,
+        } => {
+            cmd_install(no_systemd, claude_bin)?;
             0
         }
         Subcmd::Uninstall => {

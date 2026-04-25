@@ -1,16 +1,16 @@
 [package]
 name = "claude-cellar"
-version = "0.1.2"
+version = "0.3.0"
 edition = "2024"
-description = "Transparent zstd compression for Claude Code session files"
+description = "Transparent zstd compression for Claude Code session bundles via FUSE (Linux)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/OnCeUponTry/claude-cellar"
 homepage = "https://github.com/OnCeUponTry/claude-cellar"
 documentation = "https://docs.rs/claude-cellar"
 readme = "README.md"
 authors = ["Carlos Enrique Castro Lazaro"]
-keywords = ["claude-code", "compression", "zstd", "cli", "wrapper"]
-categories = ["command-line-utilities", "compression"]
+keywords = ["claude-code", "compression", "zstd", "fuse", "cli"]
+categories = ["command-line-utilities", "compression", "filesystem"]
 exclude = ["target/", ".git/", "*.bak"]
 
 [dependencies]
@@ -21,9 +21,13 @@ rayon = "1.10"
 sha2 = "0.10"
 zstd = "0.13"
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 signal-hook = "0.3"
+fuser = { version = "0.15", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 strip = true
@@ -31,6 +35,3 @@ lto = true
 opt-level = "s"
 codegen-units = 1
 panic = "abort"
-
-[target.'cfg(windows)'.dependencies]
-ctrlc = "3"

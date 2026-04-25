@@ -1,0 +1,19 @@
+[Unit]
+Description=claude-cellar FUSE mount for Claude Code session bundles
+Documentation=https://github.com/OnCeUponTry/claude-cellar
+After=default.target
+
+[Service]
+Type=simple
+# PATH covers NixOS (run/wrappers/bin for setuid fusermount3) and standard
+# distros (/usr/bin). systemd user services otherwise have a minimal PATH
+# that misses fusermount3.
+Environment=PATH=/run/wrappers/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart={{CELLAR_BIN}} mount --foreground
+ExecStop={{CELLAR_BIN}} umount
+Restart=on-failure
+RestartSec=1
+PrivateTmp=no
+
+[Install]
+WantedBy=default.target

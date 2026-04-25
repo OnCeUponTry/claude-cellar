@@ -1,41 +1,48 @@
 # claude-cellar
 
-Transparent zstd compression for Claude Code session files.
+Bundle-aware transparent zstd compression for Claude Code sessions, via
+a Linux FUSE filesystem.
 
-[Claude Code](https://claude.com/claude-code) stores every session as a plain
-JSONL file under `~/.claude/projects/**/`. Over time these accumulate — hundreds
-of MB of text that compress down to ~18% of their size but can never be
-appended to while compressed. `claude-cellar` keeps the N most recent sessions
-uncompressed and zstd-compresses the rest, then transparently re-hydrates them
-when you launch Claude so the `/resume` picker still sees every session.
+[Claude Code](https://claude.com/claude-code) stores each session as a
+top-level `<uuid>.jsonl` plus an optional sibling directory `<uuid>/`
+that holds sub-agents and tool-results. Over time these accumulate.
 
-Verified compression on real sessions: **~82% size reduction** (zstd -19).
-Hydration of 10 sessions takes **~5 ms** (parallel, rayon). Round-trip is
-hash-verified before deleting originals.
+`claude-cellar` mounts a FUSE on `~/.claude/projects/`. The session
+files (`.jsonl`) are stored compressed (`.jsonl.zst`) and decompressed
+lazily on `open`; the sibling bundle dirs (sub-agents, tool-results)
+pass through unchanged. From Claude's perspective everything looks
+exactly like the regular layout.
 
-## Why
+Verified end-to-end on real sessions with sub-agents: SHA-256 hash of
+every original byte (`.jsonl`, sub-agent files, tool-result files) is
+preserved through the mount.
 
-- Sessions are plain text; `zstd -19` reduces a 4.6 MB session to ~870 KB.
-- Compression is one-shot at session close; decompression is on the `/resume`
-  critical path, so the codec choice favors fast decoding.
-- The `/resume` picker only sees `.jsonl`, so the wrapper hydrates before
-  launching Claude and cleans up on exit — zero change to your workflow.
-
-## Install
-
-### From crates.io
+## Install (Linux only)
 
 ```bash
 cargo install claude-cellar
-claude-cellar install   # creates the shim in ~/.local/bin/claude (Unix) or %USERPROFILE%\bin\claude.cmd (Windows)
+claude-cellar install
 ```
 
-`install` auto-detects the real `claude` binary (canonical locations on
-Linux/macOS/Windows), stores the path in `~/.config/claude-cellar/claude-bin.path`,
-and replaces `claude` in PATH with a ~75-byte shim that invokes
-`claude-cellar run -- "$@"`.
+After `install`, `claude` works as always. The FUSE daemon runs as a
+systemd user service started at login.
 
-Revert with `claude-cellar uninstall`.
+If you already had Claude sessions in `~/.claude/projects/`, `install`
+auto-detects them and migrates each **bundle** (jsonl + sibling dir)
+into the store. If `~/.claude/projects/<sub>` is a symlink to another
+filesystem (e.g. NFS), `install` follows it and uses the target as the
+store, so your data stays where it was.
+
+### From the GitHub release tarball
+
+```bash
+curl -L -o /tmp/cellar.tgz \
+  https://github.com/OnCeUponTry/claude-cellar/releases/download/v0.3.0/claude-cellar-v0.3.0-x86_64-unknown-linux-musl.tar.gz
+mkdir -p ~/.local/bin
+tar -xzf /tmp/cellar.tgz -C ~/.local/bin/
+chmod +x ~/.local/bin/claude-cellar
+~/.local/bin/claude-cellar install
+```
 
 ### From source
 
@@ -44,88 +51,114 @@ git clone https://github.com/OnCeUponTry/claude-cellar
 cd claude-cellar
 cargo build --release
 cp target/release/claude-cellar ~/.local/bin/
-claude-cellar install
+~/.local/bin/claude-cellar install
 ```
 
-## Usage
+## What you don't have to do
 
-Everyday use is **transparent**. Launch `claude` as always; the shim hydrates
-compressed sessions in parallel (~5 ms for 10 files), Claude sees every
-session in `/resume`, and on exit the wrapper re-compresses any session that
-was modified and deletes the unchanged hydrated files.
-
-Manual commands for one-off operations:
-
-```bash
-# Compress all but the 5 most recent sessions (by mtime) in a directory
-claude-cellar archive ~/.claude/projects/<your-project>/ --keep 5
-
-# Preview without changes
-claude-cellar archive <dir> --keep 5 --dry-run
-
-# Compress/decompress single files
-claude-cellar compress path/to/session.jsonl
-claude-cellar decompress path/to/session.jsonl.zst
-
-# Resume a specific session by id (auto-decompresses to tmpfs if needed)
-claude-cellar resume <session-id>
-
-# List sessions with size and compression state
-claude-cellar list ~/.claude/projects/<your-project>/
-
-# Inspect the persistent log
-claude-cellar log --tail 20
-```
+- Run `claude-cellar mount` manually. systemd does it at login.
+- Decompress sessions before resuming. The FUSE shows them already
+  decompressed.
+- Worry about sub-agent files or tool-results. They pass through.
+- Worry about multiple `claude` instances. There is one daemon, every FD
+  is kernel-isolated.
+- Configure anything. Defaults work out of the box.
 
 ## Architecture
 
-| Component | Purpose |
+```
+                            ~/.claude/projects/        (FUSE mount, virtual)
+                                  │
+                                  ▼
+                         [ claude-cellar daemon ]
+                          │             │             │
+            decompress on open()  pass through    re-compress on release
+                  │              │            │             (jsonl only)
+                  ▼              ▼            ▼
+          $XDG_RUNTIME_DIR  store/<proj>/<uuid>/    store/<proj>/
+              (per-FD       (sub-agents,            <uuid>.jsonl.zst
+               scratch)     tool-results,
+                            raw, untouched)
+```
+
+| Path | Default | Override env |
+|---|---|---|
+| Mount | `~/.claude/projects/` | `CLAUDE_CELLAR_MOUNT_DIR` |
+| Store | `~/.local/share/claude-cellar/store/` | `CLAUDE_CELLAR_STORE_DIR` |
+| Scratch (tmpfs) | `$XDG_RUNTIME_DIR/claude-cellar/scratch/` | `CLAUDE_CELLAR_SCRATCH_DIR` |
+| Log | `$XDG_STATE_HOME/claude-cellar/cellar.log` | — |
+
+For NFS-shared layouts, point the store at the NFS dir; the FUSE keeps
+serving the mount locally and only touches NFS for `.zst` reads/writes.
+
+## Commands
+
+Day-to-day you run `claude` (not `claude-cellar`). The CLI is here for
+maintenance:
+
+```bash
+claude-cellar status                   # mount state, store size, daemon pid
+claude-cellar log --tail 50            # daemon activity log
+claude-cellar mount [--foreground]     # manual mount (rarely needed)
+claude-cellar umount                   # manual umount
+claude-cellar migrate-store [--from D] # migrate bundles into store layout
+claude-cellar archive <dir> --keep N   # batch compress in a non-mount dir
+claude-cellar compress <file>          # one-shot compress (stand-alone)
+claude-cellar decompress <file.zst>    # one-shot decompress
+claude-cellar list <dir>               # list sessions in a dir
+claude-cellar resume <id>              # decompress + exec claude --resume
+```
+
+## How install decides where the store lives
+
+| State of `~/.claude/projects/` | Result |
 |---|---|
-| `archive` | Scans a directory recursively for `.jsonl` sessions, keeps the N most recent uncompressed (`--keep`), compresses the rest in parallel with zstd level 19, verifies round-trip hash, then deletes originals. |
-| `run`     | Hydrates all `.jsonl.zst` → `.jsonl` in parallel, spawns the real `claude` binary with forwarded arguments, waits, then in parallel either re-compresses sessions that were modified or deletes hydrated files whose hash/mtime matches the snapshot. |
-| `install` | Auto-detects the real `claude` binary, persists its path, and replaces `~/.local/bin/claude` with a bash shim (`claude.cmd` on Windows) that routes every invocation through `run`. |
-| `resume`  | Single-session decompression to a tmpfs scratch (`$XDG_RUNTIME_DIR/claude-cellar/scratch/` on Linux, `$TMPDIR` elsewhere). |
+| Empty / absent | default store at `~/.local/share/claude-cellar/store/` |
+| Has exactly one **symlink** subdir (NFS-shared layout) | follow the symlink: that target becomes the store; bundles migrate in place under a project sub-directory named after the symlink; the symlink is removed; systemd unit gets `Environment=CLAUDE_CELLAR_STORE_DIR=<target>` |
+| Has real sub-directories with sessions | default store; migrate everything in |
 
-Signal handling: `run` installs a SIGINT/SIGTERM/SIGHUP forwarder so `Ctrl+C`
-reaches Claude but the wrapper survives to perform cleanup. Without this the
-compression state would leak on abnormal exit.
+`migrate-store` understands raw `.jsonl` (compresses on move), already-
+compressed `.jsonl.zst` (plain rename), `.meta` sidecars, and the sibling
+`<uuid>/` bundle dirs (moved as-is, preserving sub-agents and tool-results).
 
-## Paths
-
-| Platform | Log | Scratch | Config |
-|---|---|---|---|
-| Linux   | `$XDG_STATE_HOME/claude-cellar/cellar.log` (default `~/.local/state/...`) | `$XDG_RUNTIME_DIR/claude-cellar/scratch/` (tmpfs) | `$XDG_CONFIG_HOME/claude-cellar/` |
-| macOS   | `~/Library/Application Support/claude-cellar/cellar.log` | `$TMPDIR/claude-cellar-scratch/` | `~/Library/Application Support/claude-cellar/` |
-| Windows | `%LOCALAPPDATA%\claude-cellar\cellar.log` | `%TEMP%\claude-cellar-scratch\` | `%APPDATA%\claude-cellar\` |
-
-## Compatibility & edge cases
-
-claude-cellar tracks Claude Code's documented session storage. According to
-the official docs (code.claude.com/docs/en/settings), there is no documented
-override for the `~/.claude/projects/` directory itself, so by default cellar
-uses that path. The behavior with related Claude Code settings is:
+## Compatibility
 
 | Claude Code setting / env / flag | Effect on cellar |
 |---|---|
 | Default install (`~/.claude/projects/`) | Works out of the box. |
-| Filesystem symlink at `~/.claude/projects/<sanitized-cwd>` | Transparent — cellar follows symlinks like any FS-native tool. Useful for shared NFS layouts. |
-| `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1` | No `.jsonl` is written by Claude. Cellar finds zero sessions and is a no-op. |
+| `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1` | No `.jsonl` is written; FUSE sees nothing; no-op. |
 | `--no-session-persistence` (per-run) | That run does not persist; cellar ignores it. |
-| `cleanupPeriodDays` in settings.json | Claude prunes old `.jsonl` at startup, but it does **not** know about `.jsonl.zst`. Compressed sessions persist past the retention window. |
-| Custom path / unusual layout | Override with `CLAUDE_CELLAR_PROJECTS_DIR` env var or `--projects-dir <path>` flag on `run`. |
+| `cleanupPeriodDays` in settings.json | Claude prunes via the FUSE; cellar deletes the matching `.zst` and sidecar. |
 
-### Overrides
+## Configuration
 
-| Variable / flag | Purpose |
+| Var | Purpose |
 |---|---|
-| `CLAUDE_CELLAR_CLAUDE_BIN` | Explicit path to the real Claude binary; skips auto-detection. |
-| `CLAUDE_CELLAR_PROJECTS_DIR` | Override the projects root (where the `.jsonl` sessions live). |
-| `--projects-dir <path>` (on `run`) | Same override per-invocation; takes precedence over the env var. |
+| `CLAUDE_CELLAR_STORE_DIR` | Override store location (e.g. NFS path). |
+| `CLAUDE_CELLAR_MOUNT_DIR` | Override mount location (rare). |
+| `CLAUDE_CELLAR_SCRATCH_DIR` | Override scratch dir (should be tmpfs). |
+| `CLAUDE_CELLAR_MAX_FDS` | Cap on simultaneous FUSE FDs (default 16). |
+| `CLAUDE_CELLAR_CLAUDE_BIN` | Explicit path to the real Claude binary (used by `resume`). |
+
+## Platform support
+
+Linux x86_64 / aarch64 with FUSE (`CONFIG_FUSE_FS`) and `fusermount3`.
+
+claude-cellar 0.3+ does **not** run on macOS or Windows; the crate refuses
+to compile there with a clear diagnostic.
+
+## Status of older versions
+
+- **v0.2.x** is yanked: it compressed `.jsonl` but did not preserve the
+  sibling `<uuid>/` bundle dirs that Claude creates for sessions with
+  sub-agents or tool-results, so resuming such sessions could miss state.
+  Use v0.3.0 instead.
+- **v0.1.x** still works as a manual archive tool (no FUSE, no daemon).
+  Single-instance use only.
 
 ## Benchmarks
 
-Measured on three real Claude Code sessions (NixOS, zstd 1.5.7 CLI, single
-archive pass):
+Measured on three real Claude Code sessions (zstd 1.5.7, single archive):
 
 | Session size | gzip -9 | zstd -3 | zstd -19 | xz -6 |
 |---:|---:|---:|---:|---:|
@@ -133,31 +166,21 @@ archive pass):
 |   1.9 MB | 19.5% | 16.9% | **15.0%** | 14.6% |
 |   4.6 MB | 23.9% | 20.3% | **18.1%** | 17.8% |
 
-zstd -19 lands within 0.3 points of xz -6 on ratio and decompresses ~20× faster
-(important on `/resume`). zstd -3 is close on ratio with near-zero compression
-time; the default `archive` uses `-19` because compression is one-shot and
-the extra ratio is free.
-
-## Status
-
-- v0.1.0 — first public release
-- Tested on Linux x86_64 (NixOS) end-to-end: hydrate, resume, exit cleanup,
-  SIGINT survival
-- Windows and macOS: code paths are implemented (`dirs`, `Path`,
-  `Command::status`, `cfg(windows)` shim) but not yet smoke-tested on those
-  platforms in this release
+zstd -19 is within 0.3 points of xz -6 on ratio and decompresses ~20×
+faster. Default for cellar is `-19`.
 
 ## License
 
 Licensed under either of:
 
-- **MIT License** ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
-- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT License ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
 
 at your option.
 
 ### Contribution
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this work by you, as defined in the Apache-2.0 license, shall
-be dual-licensed as above, without any additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this work by you, as defined in the Apache-2.0
+license, shall be dual-licensed as above, without any additional terms
+or conditions.
