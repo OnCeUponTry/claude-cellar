@@ -262,8 +262,8 @@ the v0.1 archive command. Plus possibly an active `~/.local/bin/claude` shim.
 ```
 $ claude-cellar migrate-store --dry-run
 will move:
-  ~/.claude/projects/-home-momo/uuid-A.jsonl.zst → ~/.local/share/claude-cellar/store/-home-momo/uuid-A.jsonl.zst
-  ~/.claude/projects/-home-momo/uuid-B.jsonl.zst → ...
+  ~/.claude/projects/-home-username/uuid-A.jsonl.zst → ~/.local/share/claude-cellar/store/-home-username/uuid-A.jsonl.zst
+  ~/.claude/projects/-home-username/uuid-B.jsonl.zst → ...
 will keep raw .jsonl in place (active sessions); they're picked up on first mount.
 
 $ claude-cellar uninstall   # if v0.1 shim exists
@@ -349,7 +349,7 @@ supports FUSE since 2023):
    Verify all 4 stored.
 3. 4 simultaneous, kill -9 one mid-session. Verify others unaffected.
 4. Daemon up for 24h continuous, monitor RAM/handles for leaks.
-5. NFS-backed store (777-lab use case): same as 1-4.
+5. NFS-backed store (NFS-backed home use case): same as 1-4.
 
 ## 13. Decisions
 

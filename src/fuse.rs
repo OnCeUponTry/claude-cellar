@@ -4,16 +4,16 @@
 //! Layout from Claude's perspective (mounted on `~/.claude/projects/`):
 //!
 //!   /
-//!   ├── -home-momo/                 (project, dir)
+//!   ├── -home-username/                 (project, dir)
 //!   │   ├── abc-def.jsonl           (session, decompressed-size)
 //!   │   └── ghi-jkl.jsonl
-//!   └── -home-momo-repos-x/
+//!   └── -home-username-repos-x/
 //!       └── ...
 //!
 //! Backing store layout (e.g. `~/.local/share/claude-cellar/store/`):
 //!
 //!   /
-//!   ├── -home-momo/
+//!   ├── -home-username/
 //!   │   ├── abc-def.jsonl.zst
 //!   │   ├── abc-def.jsonl.meta      (sidecar)
 //!   │   └── ghi-jkl.jsonl.zst
