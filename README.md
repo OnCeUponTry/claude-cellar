@@ -98,11 +98,29 @@ compression state would leak on abnormal exit.
 | macOS   | `~/Library/Application Support/claude-cellar/cellar.log` | `$TMPDIR/claude-cellar-scratch/` | `~/Library/Application Support/claude-cellar/` |
 | Windows | `%LOCALAPPDATA%\claude-cellar\cellar.log` | `%TEMP%\claude-cellar-scratch\` | `%APPDATA%\claude-cellar\` |
 
-## Overrides
+## Compatibility & edge cases
 
-| Variable | Purpose |
+claude-cellar tracks Claude Code's documented session storage. According to
+the official docs (code.claude.com/docs/en/settings), there is no documented
+override for the `~/.claude/projects/` directory itself, so by default cellar
+uses that path. The behavior with related Claude Code settings is:
+
+| Claude Code setting / env / flag | Effect on cellar |
+|---|---|
+| Default install (`~/.claude/projects/`) | Works out of the box. |
+| Filesystem symlink at `~/.claude/projects/<sanitized-cwd>` | Transparent — cellar follows symlinks like any FS-native tool. Useful for shared NFS layouts. |
+| `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1` | No `.jsonl` is written by Claude. Cellar finds zero sessions and is a no-op. |
+| `--no-session-persistence` (per-run) | That run does not persist; cellar ignores it. |
+| `cleanupPeriodDays` in settings.json | Claude prunes old `.jsonl` at startup, but it does **not** know about `.jsonl.zst`. Compressed sessions persist past the retention window. |
+| Custom path / unusual layout | Override with `CLAUDE_CELLAR_PROJECTS_DIR` env var or `--projects-dir <path>` flag on `run`. |
+
+### Overrides
+
+| Variable / flag | Purpose |
 |---|---|
 | `CLAUDE_CELLAR_CLAUDE_BIN` | Explicit path to the real Claude binary; skips auto-detection. |
+| `CLAUDE_CELLAR_PROJECTS_DIR` | Override the projects root (where the `.jsonl` sessions live). |
+| `--projects-dir <path>` (on `run`) | Same override per-invocation; takes precedence over the env var. |
 
 ## Benchmarks
 

@@ -61,6 +61,9 @@ enum Subcmd {
     },
     /// Transparent wrapper: hydrate all compressed sessions, exec claude, re-compress on exit
     Run {
+        /// Override projects root (default: $CLAUDE_CELLAR_PROJECTS_DIR or ~/.claude/projects)
+        #[arg(long)]
+        projects_dir: Option<PathBuf>,
         /// Arguments forwarded verbatim to claude
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
@@ -93,6 +96,11 @@ fn strip_zst(p: &Path) -> Option<PathBuf> {
 }
 
 fn default_projects_dir() -> io::Result<PathBuf> {
+    if let Ok(custom) = std::env::var("CLAUDE_CELLAR_PROJECTS_DIR")
+        && !custom.is_empty()
+    {
+        return Ok(PathBuf::from(custom));
+    }
     let home =
         dirs::home_dir().ok_or_else(|| io::Error::other("could not resolve home directory"))?;
     Ok(home.join(".claude").join("projects"))
@@ -560,9 +568,9 @@ fn cleanup_hydrated_parallel(entries: &[Hydrated]) -> (usize, usize, usize) {
         .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
 }
 
-fn cmd_run(claude_args: Vec<OsString>) -> io::Result<i32> {
+fn cmd_run(projects_dir: Option<PathBuf>, claude_args: Vec<OsString>) -> io::Result<i32> {
     let start = Instant::now();
-    let projects = default_projects_dir()?;
+    let projects = projects_dir.map_or_else(default_projects_dir, Ok)?;
     let claude = resolve_claude_bin()?;
 
     let t0 = Instant::now();
@@ -925,7 +933,7 @@ fn run(cli: Cli) -> io::Result<i32> {
             projects_dir,
             claude_bin,
         } => cmd_resume(&id, projects_dir, claude_bin)?,
-        Subcmd::Run { args } => cmd_run(args)?,
+        Subcmd::Run { projects_dir, args } => cmd_run(projects_dir, args)?,
         Subcmd::Install { claude_bin } => {
             cmd_install(claude_bin)?;
             0
