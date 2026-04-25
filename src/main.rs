@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 mod fuse;
 mod store;
 
